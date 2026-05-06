@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell-lint:
+    name: Bash & ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n install.sh
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -q shellcheck
+
+      - name: ShellCheck (errors only)
+        run: shellcheck -S error install.sh
+
+      - name: ShellCheck (full report, non-blocking)
+        run: shellcheck install.sh || true
+
+  php-lint:
+    name: Embedded PHP lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: none
+          coverage: none
+
+      - name: Extract embedded PHP files
+        run: bash tests/extract-php.sh
+
+      - name: php -l on every extracted file
+        run: |
+          set -e
+          for f in tests/_extracted/*.php; do
+            echo "::group::Linting $f"
+            php -l "$f"
+            echo "::endgroup::"
+          done
+
+  bats-tests:
+    name: Bash unit tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -q bats
+
+      - name: Run bats
+        run: bats --tap tests/install.bats
+
+  php-validators:
+    name: PHP validator unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      - name: Run validator tests
+        run: php tests/test-validators.php
+
+  caddyfile-validation:
+    name: Validate Caddyfile syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Caddy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+            | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+            | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -q caddy
+
+      - name: Validate sample Caddyfile (representative shape)
+        run: caddy validate --config tests/sample-caddyfile --adapter caddyfile
