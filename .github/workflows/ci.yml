@@ -97,5 +97,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -q caddy
 
+      - name: Prepare log directory (caddy validate öffnet Log-Files real)
+        run: |
+          sudo mkdir -p /var/log/caddy
+          sudo chmod 1777 /var/log/caddy
+
       - name: Validate sample Caddyfile (representative shape)
         run: caddy validate --config tests/sample-caddyfile --adapter caddyfile
