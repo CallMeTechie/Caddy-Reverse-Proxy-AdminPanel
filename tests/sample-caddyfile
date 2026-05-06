@@ -1,0 +1,56 @@
+# Repräsentative Caddyfile-Form, die install.sh zur Laufzeit generiert.
+# Wird im CI-Job 'caddyfile-validation' per `caddy validate` geprüft.
+# IPs aus RFC 5737 (Documentation), Domains aus RFC 2606 (.example).
+
+{
+    admin localhost:2019
+    email admin@example.com
+}
+
+# Admin-Panel-Site (HTTPS-Variante mit Auto-HTTPS)
+admin.example.com {
+    root * /var/www/caddy-admin
+    php_fastcgi unix//run/php/php-fpm.sock
+    file_server
+    @denyPrivate path /lib/* /domains.json /.*
+    respond @denyPrivate 403
+}
+
+# Reverse-Proxy mit Let's Encrypt (Auto-HTTPS via globaler email-Direktive)
+app.example.com {
+    reverse_proxy http://192.0.2.10:8080 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+    log {
+        output file /var/log/caddy/app.example.com.log
+    }
+}
+
+# Reverse-Proxy zu HTTPS-Backend
+internal.example.org {
+    reverse_proxy https://192.0.2.20:8443 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+    log {
+        output file /var/log/caddy/internal.example.org.log
+    }
+}
+
+# Wildcard-Domain
+*.tenant.example.com {
+    reverse_proxy http://192.0.2.30:80 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+    log {
+        output file /var/log/caddy/_.tenant.example.com.log
+    }
+}
