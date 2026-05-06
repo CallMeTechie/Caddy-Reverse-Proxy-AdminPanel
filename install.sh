@@ -1,1463 +1,1400 @@
 #!/bin/bash
-
 ################################################################################
-# Caddy Reverse Proxy Admin Panel - Automatisches Installations-Script
-# 
-# Autor: Techie
-# Website: https://callmetechie.de
-# 
-# Dieses Script installiert und konfiguriert:
-# - Caddy v2 mit Let's Encrypt
-# - PHP und Apache/Nginx
-# - Admin Panel Web-GUI
-# - Alle erforderlichen Berechtigungen und Konfigurationen
+# Caddy Reverse Proxy Admin Panel - Hardened Installer (v2.0)
+#
+# Original-Idee: Techie (https://callmetechie.de)
+# Hardened-Variante: behebt kritische Sicherheitsprobleme + Bugs des Originals.
+#
+# Was wurde gegenüber v1 geändert:
+#   - Authentifizierung: Login-Form, bcrypt-Hash, PHP-Sessions, Brute-Force-Limit
+#   - CSRF-Schutz für alle mutierenden API-Endpunkte
+#   - Same-Origin: kein "Access-Control-Allow-Origin: *" mehr
+#   - Caddyfile-Sanitizer: strikte Domain-/IP-/Port-Validierung, Logpfad escaped,
+#     Direktiven-Injection ("additional_config") entfernt
+#   - Sudoers ohne Argumente: Reload-Helper liest fixen Stage-Pfad
+#   - Echtes Let's Encrypt via globaler email-Direktive (kein "tls internal" mehr)
+#   - SSL-Verify in curl aktiviert
+#   - flock() für domains.json gegen Race Conditions
+#   - Caddy + PHP-FPM nativ (Apache/Nginx-Doppelstack entfernt)
+#   - Login-Credentials und Konfiguration werden interaktiv abgefragt
 #
 # Verwendung: sudo bash install.sh
 ################################################################################
 
-set -e  # Bei Fehler abbrechen
+set -euo pipefail
 
-# Farben für Output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 
-# Konfigurationsvariablen
+# Konfigurationspfade (fest)
 INSTALL_DIR="/var/www/caddy-admin"
 CADDY_CONFIG_DIR="/etc/caddy"
+CADDY_LIVE_FILE="${CADDY_CONFIG_DIR}/Caddyfile"
+ADMIN_CONFIG_DIR="/etc/caddy-admin"
+ADMIN_CONFIG_FILE="${ADMIN_CONFIG_DIR}/config.json"
+ADMIN_AUTH_FILE="${ADMIN_CONFIG_DIR}/auth.json"
+STAGE_DIR="/var/lib/caddy-admin"
+STAGE_FILE="${STAGE_DIR}/Caddyfile.staged"
+RATE_LIMIT_FILE="${STAGE_DIR}/rate-limit.json"
 BACKUP_DIR="/var/backups/caddy"
 LOG_DIR="/var/log/caddy"
-ADMIN_PORT="8080"
+RELOAD_HELPER="/usr/local/bin/caddy-admin-reload"
+SUDOERS_FILE="/etc/sudoers.d/caddy-admin"
+
+# Aus Eingaben befüllt
+ADMIN_PORT=""
 ADMIN_DOMAIN=""
 ADMIN_EMAIL=""
-USE_NGINX=false
+ADMIN_USER=""
+ADMIN_PASS=""
 ENABLE_SSL=false
 ENABLE_FIREWALL=true
 
-# Script muss als root ausgeführt werden
+# Aus detect_*-Schritten befüllt
+OS_ID=""
+PKG_INSTALL=""
+PKG_UPDATE=""
+PHP_VERSION=""
+PHP_FPM_SOCK=""
+PHP_FPM_SERVICE=""
+WEB_USER=""
+WEB_GROUP=""
+
+# ---- Helper -----------------------------------------------------------------
+
+err()  { echo -e "${RED}✗ $*${NC}" >&2; exit 1; }
+warn() { echo -e "${YELLOW}! $*${NC}" >&2; }
+info() { echo -e "${YELLOW}→ $*${NC}"; }
+ok()   { echo -e "${GREEN}✓ $*${NC}"; }
+hr()   { echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"; }
+
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}Dieses Script muss als root ausgeführt werden!${NC}"
-        echo "Verwendung: sudo bash install.sh"
-        exit 1
-    fi
+    [[ $EUID -eq 0 ]] || err "Dieses Script muss als root ausgeführt werden (sudo bash install.sh)"
 }
 
-# Banner anzeigen
 show_banner() {
     clear
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                                                              ║${NC}"
-    echo -e "${BLUE}║     ${GREEN}Caddy Reverse Proxy Admin Panel - Installer${BLUE}             ║${NC}"
-    echo -e "${BLUE}║                      Version 1.0                             ║${NC}"
-    echo -e "${BLUE}║                                                              ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}Caddy Reverse Proxy Admin Panel - Hardened Installer${BLUE}        ║${NC}"
+    echo -e "${BLUE}║                       Version 2.0                            ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
+    echo
 }
 
-# Betriebssystem erkennen
 detect_os() {
-    echo -e "${YELLOW}→ Erkenne Betriebssystem...${NC}"
-    
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS=$NAME
-        OS_VERSION=$VERSION_ID
-        OS_ID=$ID
-        
-        echo -e "${GREEN}✓ Erkannt: $OS $OS_VERSION${NC}"
-        
-        case $OS_ID in
-            ubuntu|debian)
-                PKG_MANAGER="apt"
-                PKG_UPDATE="apt update"
-                PKG_INSTALL="apt install -y"
-                PHP_VERSION=$(apt-cache show php | grep -E "^Version:" | head -1 | cut -d' ' -f2 | cut -d'+' -f1 | cut -d'.' -f1,2)
-                ;;
-            centos|rhel|fedora)
-                PKG_MANAGER="yum"
-                PKG_UPDATE="yum update -y"
-                PKG_INSTALL="yum install -y"
-                if [[ "$OS_ID" == "fedora" ]]; then
-                    PKG_MANAGER="dnf"
-                    PKG_UPDATE="dnf update -y"
-                    PKG_INSTALL="dnf install -y"
-                fi
-                ;;
-            *)
-                echo -e "${RED}✗ Nicht unterstütztes Betriebssystem: $OS_ID${NC}"
-                exit 1
-                ;;
-        esac
-    else
-        echo -e "${RED}✗ Betriebssystem konnte nicht erkannt werden${NC}"
-        exit 1
-    fi
+    info "Erkenne Betriebssystem..."
+    [[ -f /etc/os-release ]] || err "Betriebssystem konnte nicht erkannt werden"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    case "$OS_ID" in
+        ubuntu|debian)
+            PKG_INSTALL="apt-get install -y -q"
+            PKG_UPDATE="apt-get update -q"
+            ;;
+        centos|rhel|rocky|almalinux)
+            PKG_INSTALL="yum install -y -q"
+            PKG_UPDATE="yum makecache -q"
+            ;;
+        fedora)
+            PKG_INSTALL="dnf install -y -q"
+            PKG_UPDATE="dnf makecache -q"
+            ;;
+        *)
+            err "Nicht unterstütztes Betriebssystem: $OS_ID (unterstützt: Debian, Ubuntu, CentOS, RHEL, Rocky, AlmaLinux, Fedora)"
+            ;;
+    esac
+    ok "Erkannt: ${PRETTY_NAME:-$OS_ID}"
 }
 
-# Benutzereinstellungen abfragen
-get_user_input() {
-    echo ""
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+# ---- Eingaben ---------------------------------------------------------------
+
+is_valid_domain() {
+    [[ "$1" =~ ^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]
+}
+
+is_valid_email() {
+    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+prompt_config() {
+    hr
     echo -e "${YELLOW}Konfigurationseinstellungen:${NC}"
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    # Admin Domain
-    read -p "Domain für Admin Panel (z.B. admin.example.com) [localhost]: " ADMIN_DOMAIN
-    ADMIN_DOMAIN=${ADMIN_DOMAIN:-localhost}
-    
-    # Admin E-Mail
-    read -p "E-Mail für Let's Encrypt (erforderlich für SSL): " ADMIN_EMAIL
-    
-    # SSL aktivieren?
-    if [[ "$ADMIN_DOMAIN" != "localhost" ]] && [[ -n "$ADMIN_EMAIL" ]]; then
-        read -p "SSL für Admin Panel aktivieren? (j/n) [j]: " ssl_choice
-        ssl_choice=${ssl_choice:-j}
-        if [[ "$ssl_choice" == "j" ]] || [[ "$ssl_choice" == "J" ]]; then
-            ENABLE_SSL=true
+    hr
+    echo
+
+    while true; do
+        read -r -p "Domain für Admin Panel (z.B. admin.example.com) [localhost]: " ADMIN_DOMAIN
+        ADMIN_DOMAIN="${ADMIN_DOMAIN:-localhost}"
+        if [[ "$ADMIN_DOMAIN" == "localhost" ]] || is_valid_domain "$ADMIN_DOMAIN"; then
+            break
         fi
+        echo -e "${RED}Ungültige Domain. Beispiel: admin.example.com${NC}"
+    done
+
+    while true; do
+        read -r -p "E-Mail für Let's Encrypt: " ADMIN_EMAIL
+        if is_valid_email "$ADMIN_EMAIL"; then
+            break
+        fi
+        echo -e "${RED}Ungültige E-Mail-Adresse${NC}"
+    done
+
+    if [[ "$ADMIN_DOMAIN" != "localhost" ]]; then
+        read -r -p "SSL via Let's Encrypt für Admin-Domain aktivieren? (j/n) [j]: " ans
+        ans="${ans:-j}"
+        if [[ "$ans" =~ ^[jJ]$ ]]; then
+            ENABLE_SSL=true
+        else
+            ENABLE_SSL=false
+        fi
+    else
+        ENABLE_SSL=false
+        echo -e "${YELLOW}  (localhost → kein Let's Encrypt möglich; lokales TLS via 'tls internal')${NC}"
     fi
-    
-    # Webserver auswählen
-    echo ""
-    echo "Welchen Webserver möchten Sie verwenden?"
-    echo "1) Apache (Standard)"
-    echo "2) Nginx"
-    read -p "Auswahl [1]: " webserver_choice
-    webserver_choice=${webserver_choice:-1}
-    
-    if [[ "$webserver_choice" == "2" ]]; then
-        USE_NGINX=true
-    fi
-    
-    # Admin Port
-    read -p "Port für Admin Panel [8080]: " ADMIN_PORT
-    ADMIN_PORT=${ADMIN_PORT:-8080}
-    
-    # Firewall konfigurieren?
-    read -p "Firewall automatisch konfigurieren? (j/n) [j]: " fw_choice
-    fw_choice=${fw_choice:-j}
-    if [[ "$fw_choice" == "n" ]] || [[ "$fw_choice" == "N" ]]; then
+
+    while true; do
+        read -r -p "Port für Admin Panel [8080]: " ADMIN_PORT
+        ADMIN_PORT="${ADMIN_PORT:-8080}"
+        if [[ "$ADMIN_PORT" =~ ^[0-9]+$ ]] && (( ADMIN_PORT >= 1024 && ADMIN_PORT <= 65535 )); then
+            break
+        fi
+        echo -e "${RED}Port muss eine Zahl zwischen 1024 und 65535 sein${NC}"
+    done
+
+    echo
+    echo -e "${BLUE}Login-Credentials für das Admin Panel:${NC}"
+
+    while true; do
+        read -r -p "Admin-Benutzername (3-32 Zeichen, a-z 0-9 _): " ADMIN_USER
+        if [[ "$ADMIN_USER" =~ ^[a-z0-9_]{3,32}$ ]]; then
+            break
+        fi
+        echo -e "${RED}Ungültiger Benutzername (nur Kleinbuchstaben, Zahlen, Unterstrich; 3-32 Zeichen)${NC}"
+    done
+
+    while true; do
+        read -r -s -p "Admin-Passwort (mind. 12 Zeichen): " ADMIN_PASS
+        echo
+        if [[ ${#ADMIN_PASS} -lt 12 ]]; then
+            echo -e "${RED}Passwort zu kurz (mindestens 12 Zeichen)${NC}"
+            continue
+        fi
+        read -r -s -p "Passwort bestätigen: " confirm
+        echo
+        if [[ "$ADMIN_PASS" != "$confirm" ]]; then
+            echo -e "${RED}Passwörter stimmen nicht überein${NC}"
+            continue
+        fi
+        break
+    done
+
+    echo
+    read -r -p "Firewall (UFW) automatisch konfigurieren? (j/n) [j]: " ans
+    ans="${ans:-j}"
+    if [[ "$ans" =~ ^[nN]$ ]]; then
         ENABLE_FIREWALL=false
     fi
-    
-    echo ""
-    echo -e "${GREEN}Konfiguration:${NC}"
-    echo -e "  Domain: ${BLUE}$ADMIN_DOMAIN${NC}"
-    echo -e "  E-Mail: ${BLUE}$ADMIN_EMAIL${NC}"
-    echo -e "  SSL: ${BLUE}$(if $ENABLE_SSL; then echo "Ja"; else echo "Nein"; fi)${NC}"
-    echo -e "  Webserver: ${BLUE}$(if $USE_NGINX; then echo "Nginx"; else echo "Apache"; fi)${NC}"
-    echo -e "  Port: ${BLUE}$ADMIN_PORT${NC}"
-    echo -e "  Firewall: ${BLUE}$(if $ENABLE_FIREWALL; then echo "Ja"; else echo "Nein"; fi)${NC}"
-    echo ""
-    
-    read -p "Fortfahren mit diesen Einstellungen? (j/n) [j]: " confirm
-    confirm=${confirm:-j}
-    if [[ "$confirm" != "j" ]] && [[ "$confirm" != "J" ]]; then
-        echo -e "${RED}Installation abgebrochen${NC}"
-        exit 1
-    fi
+
+    echo
+    echo -e "${GREEN}Zusammenfassung:${NC}"
+    echo -e "  Domain:    ${BLUE}${ADMIN_DOMAIN}${NC}"
+    echo -e "  E-Mail:    ${BLUE}${ADMIN_EMAIL}${NC}"
+    echo -e "  SSL:       ${BLUE}$($ENABLE_SSL && echo "Ja (Let's Encrypt)" || echo "Nein")${NC}"
+    echo -e "  Port:      ${BLUE}${ADMIN_PORT}${NC}"
+    echo -e "  Benutzer:  ${BLUE}${ADMIN_USER}${NC}"
+    echo -e "  Passwort:  ${BLUE}(${#ADMIN_PASS} Zeichen, gehasht gespeichert)${NC}"
+    echo -e "  Firewall:  ${BLUE}$($ENABLE_FIREWALL && echo Ja || echo Nein)${NC}"
+    echo
+    read -r -p "Mit diesen Einstellungen fortfahren? (j/n) [j]: " ans
+    ans="${ans:-j}"
+    [[ "$ans" =~ ^[jJ]$ ]] || err "Installation vom Benutzer abgebrochen"
 }
 
-# System aktualisieren
+# ---- Installation -----------------------------------------------------------
+
 update_system() {
-    echo ""
-    echo -e "${YELLOW}→ Aktualisiere System...${NC}"
-    $PKG_UPDATE > /dev/null 2>&1
-    echo -e "${GREEN}✓ System aktualisiert${NC}"
+    info "Aktualisiere Paketindex..."
+    $PKG_UPDATE >/dev/null
+    ok "Paketindex aktualisiert"
 }
 
-# Basis-Pakete installieren
-install_base_packages() {
-    echo -e "${YELLOW}→ Installiere Basis-Pakete...${NC}"
-    
-    PACKAGES="curl wget git sudo ufw software-properties-common gnupg2 lsb-release"
-    
-    if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-        PACKAGES="$PACKAGES apt-transport-https ca-certificates"
-    fi
-    
-    $PKG_INSTALL $PACKAGES > /dev/null 2>&1
-    echo -e "${GREEN}✓ Basis-Pakete installiert${NC}"
-}
-
-# Caddy installieren
 install_caddy() {
-    echo -e "${YELLOW}→ Installiere Caddy...${NC}"
-    
-    if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-        # Caddy GPG key und Repository hinzufügen
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
-        
-        $PKG_UPDATE > /dev/null 2>&1
-        $PKG_INSTALL caddy > /dev/null 2>&1
-        
-    elif [[ "$OS_ID" == "centos" ]] || [[ "$OS_ID" == "rhel" ]] || [[ "$OS_ID" == "fedora" ]]; then
-        # Caddy über COPR installieren
-        if [[ "$OS_ID" == "fedora" ]]; then
-            dnf copr enable @caddy/caddy -y > /dev/null 2>&1
-            dnf install caddy -y > /dev/null 2>&1
-        else
-            yum copr enable @caddy/caddy -y > /dev/null 2>&1
-            yum install caddy -y > /dev/null 2>&1
+    info "Installiere Caddy..."
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        $PKG_INSTALL curl gnupg ca-certificates apt-transport-https debian-keyring debian-archive-keyring >/dev/null
+        if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+                | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
         fi
-    fi
-    
-    # Caddy Service aktivieren
-    systemctl enable caddy > /dev/null 2>&1
-    
-    echo -e "${GREEN}✓ Caddy installiert${NC}"
-}
-
-# PHP installieren
-install_php() {
-    echo -e "${YELLOW}→ Installiere PHP...${NC}"
-    
-    if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-        $PKG_INSTALL php php-cli php-fpm php-json php-curl php-mbstring php-xml php-zip > /dev/null 2>&1
-        
-        # PHP-FPM für Nginx konfigurieren
-        if $USE_NGINX; then
-            PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
-            systemctl enable $PHP_FPM_SERVICE > /dev/null 2>&1
-            systemctl start $PHP_FPM_SERVICE > /dev/null 2>&1
-        fi
-        
-    elif [[ "$OS_ID" == "centos" ]] || [[ "$OS_ID" == "rhel" ]] || [[ "$OS_ID" == "fedora" ]]; then
-        $PKG_INSTALL php php-cli php-fpm php-json php-mbstring php-xml php-zip > /dev/null 2>&1
-        
-        if $USE_NGINX; then
-            systemctl enable php-fpm > /dev/null 2>&1
-            systemctl start php-fpm > /dev/null 2>&1
-        fi
-    fi
-    
-    echo -e "${GREEN}✓ PHP installiert${NC}"
-}
-
-# Webserver installieren
-install_webserver() {
-    if $USE_NGINX; then
-        echo -e "${YELLOW}→ Installiere Nginx...${NC}"
-        $PKG_INSTALL nginx > /dev/null 2>&1
-        systemctl enable nginx > /dev/null 2>&1
-        echo -e "${GREEN}✓ Nginx installiert${NC}"
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+            >/etc/apt/sources.list.d/caddy-stable.list
+        $PKG_UPDATE >/dev/null
+        $PKG_INSTALL caddy >/dev/null
     else
-        echo -e "${YELLOW}→ Installiere Apache...${NC}"
-        
-        if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-            $PKG_INSTALL apache2 libapache2-mod-php > /dev/null 2>&1
-            systemctl enable apache2 > /dev/null 2>&1
-            
-            # Module aktivieren
-            a2enmod rewrite > /dev/null 2>&1
-            a2enmod proxy > /dev/null 2>&1
-            a2enmod proxy_http > /dev/null 2>&1
-            
-        elif [[ "$OS_ID" == "centos" ]] || [[ "$OS_ID" == "rhel" ]] || [[ "$OS_ID" == "fedora" ]]; then
-            $PKG_INSTALL httpd mod_php > /dev/null 2>&1
-            systemctl enable httpd > /dev/null 2>&1
+        if [[ "$OS_ID" == "fedora" ]]; then
+            $PKG_INSTALL 'dnf-command(copr)' >/dev/null 2>&1 || true
+            dnf copr enable -y @caddy/caddy >/dev/null
+        else
+            yum install -y -q yum-plugin-copr >/dev/null 2>&1 || true
+            yum copr enable -y @caddy/caddy >/dev/null
         fi
-        
-        echo -e "${GREEN}✓ Apache installiert${NC}"
+        $PKG_INSTALL caddy >/dev/null
     fi
+    systemctl enable caddy >/dev/null
+    ok "Caddy installiert"
 }
 
-# Admin Panel Dateien erstellen
-create_admin_panel_files() {
-    echo -e "${YELLOW}→ Erstelle Admin Panel Dateien...${NC}"
-    
-    # Verzeichnis erstellen
-    mkdir -p $INSTALL_DIR
-    
-    # index.html erstellen
-    cat > $INSTALL_DIR/index.html << 'EOHTML'
+install_php() {
+    info "Installiere PHP-FPM..."
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        $PKG_INSTALL php-fpm php-cli php-curl php-mbstring php-xml >/dev/null
+        WEB_USER="www-data"
+        WEB_GROUP="www-data"
+    else
+        $PKG_INSTALL php php-fpm php-cli php-mbstring php-xml >/dev/null
+        WEB_USER="apache"
+        WEB_GROUP="apache"
+    fi
+
+    PHP_VERSION="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
+    [[ -n "$PHP_VERSION" ]] || err "PHP-Version konnte nicht ermittelt werden"
+
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
+        PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
+    else
+        PHP_FPM_SERVICE="php-fpm"
+        PHP_FPM_SOCK="/run/php-fpm/www.sock"
+    fi
+
+    systemctl enable "$PHP_FPM_SERVICE" >/dev/null
+    systemctl restart "$PHP_FPM_SERVICE"
+
+    if id caddy >/dev/null 2>&1; then
+        usermod -a -G "$WEB_GROUP" caddy || true
+    fi
+
+    ok "PHP ${PHP_VERSION} mit FPM-Service ${PHP_FPM_SERVICE} installiert"
+}
+
+# ---- Verzeichnisse ---------------------------------------------------------
+
+setup_directories() {
+    info "Erstelle Verzeichnisse..."
+    install -d -m 750 -o "$WEB_USER" -g "$WEB_GROUP" "$INSTALL_DIR"
+    install -d -m 750 -o root        -g "$WEB_GROUP" "$ADMIN_CONFIG_DIR"
+    install -d -m 750 -o "$WEB_USER" -g "$WEB_GROUP" "$STAGE_DIR"
+    install -d -m 755 -o root        -g root         "$BACKUP_DIR"
+    if id caddy >/dev/null 2>&1; then
+        install -d -m 755 -o caddy -g caddy "$LOG_DIR"
+    else
+        install -d -m 755 "$LOG_DIR"
+    fi
+    ok "Verzeichnisse vorbereitet"
+}
+
+# ---- Konfigurationsdateien -------------------------------------------------
+
+write_config_files() {
+    info "Schreibe Konfiguration und Auth-Datei..."
+
+    local pw_hash
+    pw_hash="$(ADMIN_PASS_RAW="$ADMIN_PASS" php -r '
+        echo password_hash(getenv("ADMIN_PASS_RAW"), PASSWORD_BCRYPT, ["cost" => 12]);
+    ')"
+    [[ -n "$pw_hash" ]] || err "Konnte Passwort-Hash nicht erzeugen"
+
+    php -r '
+        echo json_encode(["username" => $argv[1], "password_hash" => $argv[2]], JSON_PRETTY_PRINT);
+    ' "$ADMIN_USER" "$pw_hash" > "$ADMIN_AUTH_FILE"
+    chown "root:${WEB_GROUP}" "$ADMIN_AUTH_FILE"
+    chmod 640 "$ADMIN_AUTH_FILE"
+
+    php -r '
+        $cfg = [
+            "admin_domain"    => $argv[1],
+            "admin_email"     => $argv[2],
+            "admin_port"      => intval($argv[3]),
+            "enable_ssl"      => $argv[4] === "true",
+            "install_dir"     => $argv[5],
+            "log_dir"         => $argv[6],
+            "stage_file"      => $argv[7],
+            "live_caddyfile"  => $argv[8],
+            "rate_limit_file" => $argv[9],
+        ];
+        echo json_encode($cfg, JSON_PRETTY_PRINT);
+    ' "$ADMIN_DOMAIN" "$ADMIN_EMAIL" "$ADMIN_PORT" "$($ENABLE_SSL && echo true || echo false)" \
+      "$INSTALL_DIR" "$LOG_DIR" "$STAGE_FILE" "$CADDY_LIVE_FILE" "$RATE_LIMIT_FILE" \
+      > "$ADMIN_CONFIG_FILE"
+    chown "root:${WEB_GROUP}" "$ADMIN_CONFIG_FILE"
+    chmod 640 "$ADMIN_CONFIG_FILE"
+
+    ADMIN_PASS=""
+
+    ok "Auth- und Konfigdatei geschrieben (Passwort als bcrypt-Hash, mode 0640)"
+}
+
+# ---- Panel-Dateien ----------------------------------------------------------
+
+write_panel_files() {
+    info "Schreibe Admin-Panel-Dateien..."
+
+    cat > "${INSTALL_DIR}/index.php" <<'EOPHP'
+<?php
+require_once __DIR__ . '/lib/auth.php';
+auth_init_session();
+
+if (!auth_is_logged_in()) {
+    header('Location: login.php');
+    exit;
+}
+
+$csrf = auth_csrf_token();
+?>
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="<?= htmlspecialchars($csrf, ENT_QUOTES) ?>">
     <title>Caddy Reverse Proxy Verwaltung</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
     <style>
-        .domain-card {
-            transition: transform 0.2s;
-        }
-        .domain-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-        }
-        .status-badge {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-        }
-        .loading-spinner {
-            display: none;
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            z-index: 9999;
-        }
-        .toast-container {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 9999;
-        }
+        .domain-card { transition: transform 0.2s; }
+        .domain-card:hover { transform: translateY(-3px); box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        .loading-spinner { display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:9999; }
+        .toast-container { position:fixed; top:20px; right:20px; z-index:9999; }
     </style>
 </head>
 <body>
-    <!-- Navigation -->
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
-        <div class="container-fluid">
-            <a class="navbar-brand" href="#">
-                <i class="bi bi-server"></i> Caddy Proxy Manager
-            </a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav ms-auto">
-                    <li class="nav-item">
-                        <button class="btn btn-success" onclick="reloadCaddy()">
-                            <i class="bi bi-arrow-clockwise"></i> Caddy Neu Laden
-                        </button>
-                    </li>
-                </ul>
-            </div>
-        </div>
-    </nav>
-
-    <!-- Main Container -->
-    <div class="container mt-4">
-        <!-- Statistics Cards -->
-        <div class="row mb-4">
-            <div class="col-md-4">
-                <div class="card bg-info text-white">
-                    <div class="card-body">
-                        <h5 class="card-title"><i class="bi bi-globe"></i> Aktive Domains</h5>
-                        <h2 class="card-text" id="activeDomains">0</h2>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card bg-success text-white">
-                    <div class="card-body">
-                        <h5 class="card-title"><i class="bi bi-check-circle"></i> Online</h5>
-                        <h2 class="card-text" id="onlineServices">0</h2>
-                    </div>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card bg-warning text-white">
-                    <div class="card-body">
-                        <h5 class="card-title"><i class="bi bi-exclamation-triangle"></i> Offline</h5>
-                        <h2 class="card-text" id="offlineServices">0</h2>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Add New Domain Button -->
-        <div class="row mb-3">
-            <div class="col-12">
-                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addDomainModal">
-                    <i class="bi bi-plus-circle"></i> Neue Domain hinzufügen
-                </button>
-                <button class="btn btn-secondary" onclick="loadDomains()">
-                    <i class="bi bi-arrow-repeat"></i> Aktualisieren
-                </button>
-            </div>
-        </div>
-
-        <!-- Domains List -->
-        <div class="row" id="domainsList">
-            <!-- Domain cards will be loaded here -->
+<nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="#"><i class="bi bi-server"></i> Caddy Proxy Manager</a>
+        <div class="ms-auto d-flex gap-2 align-items-center">
+            <button class="btn btn-success" onclick="reloadCaddy()"><i class="bi bi-arrow-clockwise"></i> Caddy neu laden</button>
+            <span class="navbar-text text-white-50">
+                <i class="bi bi-person-circle"></i> <?= htmlspecialchars($_SESSION['username'] ?? '', ENT_QUOTES) ?>
+            </span>
+            <a class="btn btn-outline-light btn-sm" href="logout.php"><i class="bi bi-box-arrow-right"></i> Logout</a>
         </div>
     </div>
+</nav>
 
-    <!-- Add/Edit Domain Modal -->
-    <div class="modal fade" id="addDomainModal" tabindex="-1">
-        <div class="modal-dialog modal-lg">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="modalTitle">Neue Domain hinzufügen</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                </div>
-                <div class="modal-body">
-                    <form id="domainForm">
-                        <input type="hidden" id="domainId" name="id">
-                        <div class="row">
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="domain" class="form-label">Domain</label>
-                                    <input type="text" class="form-control" id="domain" name="domain" placeholder="beispiel.de" required>
-                                    <small class="text-muted">Ohne http:// oder https://</small>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="targetIp" class="form-label">Ziel IP-Adresse</label>
-                                    <input type="text" class="form-control" id="targetIp" name="target_ip" placeholder="192.168.1.100" required>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="row">
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="targetPort" class="form-label">Ziel Port</label>
-                                    <input type="number" class="form-control" id="targetPort" name="target_port" placeholder="80" required>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="protocol" class="form-label">Protokoll</label>
-                                    <select class="form-select" id="protocol" name="protocol">
-                                        <option value="http">HTTP</option>
-                                        <option value="https">HTTPS</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="row">
-                            <div class="col-md-12">
-                                <div class="mb-3">
-                                    <div class="form-check form-switch">
-                                        <input class="form-check-input" type="checkbox" id="enableSsl" name="enable_ssl">
-                                        <label class="form-check-label" for="enableSsl">
-                                            SSL/TLS aktivieren (Let's Encrypt)
-                                        </label>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="row">
-                            <div class="col-md-12">
-                                <div class="mb-3">
-                                    <label for="additionalConfig" class="form-label">Zusätzliche Konfiguration (Optional)</label>
-                                    <textarea class="form-control" id="additionalConfig" name="additional_config" rows="3" placeholder="Zusätzliche Caddy-Direktiven"></textarea>
-                                </div>
-                            </div>
-                        </div>
-                    </form>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Abbrechen</button>
-                    <button type="button" class="btn btn-primary" onclick="saveDomain()">Speichern</button>
-                </div>
+<div class="container mt-4">
+    <div class="row mb-4">
+        <div class="col-md-4"><div class="card bg-info text-white"><div class="card-body">
+            <h5 class="card-title"><i class="bi bi-globe"></i> Domains</h5><h2 id="activeDomains">0</h2>
+        </div></div></div>
+        <div class="col-md-4"><div class="card bg-success text-white"><div class="card-body">
+            <h5 class="card-title"><i class="bi bi-check-circle"></i> Online</h5><h2 id="onlineServices">0</h2>
+        </div></div></div>
+        <div class="col-md-4"><div class="card bg-warning text-white"><div class="card-body">
+            <h5 class="card-title"><i class="bi bi-exclamation-triangle"></i> Offline</h5><h2 id="offlineServices">0</h2>
+        </div></div></div>
+    </div>
+
+    <div class="row mb-3"><div class="col-12">
+        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addDomainModal">
+            <i class="bi bi-plus-circle"></i> Neue Domain hinzufügen
+        </button>
+        <button class="btn btn-secondary" onclick="loadDomains()"><i class="bi bi-arrow-repeat"></i> Aktualisieren</button>
+    </div></div>
+
+    <div class="row" id="domainsList"></div>
+</div>
+
+<div class="modal fade" id="addDomainModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+    <div class="modal-header">
+        <h5 class="modal-title" id="modalTitle">Neue Domain hinzufügen</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+    </div>
+    <div class="modal-body"><form id="domainForm">
+        <input type="hidden" id="domainId" name="id">
+        <div class="row">
+            <div class="col-md-6 mb-3">
+                <label class="form-label" for="domain">Domain</label>
+                <input type="text" class="form-control" id="domain" name="domain" placeholder="beispiel.de" required>
+                <small class="text-muted">Ohne Protokoll. Wildcards: *.beispiel.de</small>
+            </div>
+            <div class="col-md-6 mb-3">
+                <label class="form-label" for="targetIp">Ziel IP</label>
+                <input type="text" class="form-control" id="targetIp" name="target_ip" placeholder="192.168.1.100" required>
+            </div>
+            <div class="col-md-6 mb-3">
+                <label class="form-label" for="targetPort">Ziel Port</label>
+                <input type="number" class="form-control" id="targetPort" name="target_port" min="1" max="65535" placeholder="80" required>
+            </div>
+            <div class="col-md-6 mb-3">
+                <label class="form-label" for="protocol">Protokoll zum Backend</label>
+                <select class="form-select" id="protocol" name="protocol">
+                    <option value="http">HTTP</option>
+                    <option value="https">HTTPS</option>
+                </select>
             </div>
         </div>
-    </div>
-
-    <!-- Loading Spinner -->
-    <div class="loading-spinner">
-        <div class="spinner-border text-primary" role="status" style="width: 3rem; height: 3rem;">
-            <span class="visually-hidden">Laden...</span>
+        <div class="form-check form-switch mb-3">
+            <input class="form-check-input" type="checkbox" id="enableSsl" name="enable_ssl">
+            <label class="form-check-label" for="enableSsl">Let's-Encrypt-Zertifikat (Domain muss öffentlich erreichbar sein)</label>
         </div>
+    </form></div>
+    <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Abbrechen</button>
+        <button type="button" class="btn btn-primary" onclick="saveDomain()">Speichern</button>
     </div>
+</div></div></div>
 
-    <!-- Toast Container -->
-    <div class="toast-container"></div>
+<div class="loading-spinner"><div class="spinner-border text-primary" style="width:3rem;height:3rem"></div></div>
+<div class="toast-container"></div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="admin.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="admin.js"></script>
 </body>
 </html>
-EOHTML
+EOPHP
 
-    # admin.js erstellen (JavaScript separat für bessere Wartbarkeit)
-    cat > $INSTALL_DIR/admin.js << 'EOJS'
-// Initialize
-document.addEventListener('DOMContentLoaded', function() {
+    cat > "${INSTALL_DIR}/login.php" <<'EOPHP'
+<?php
+require_once __DIR__ . '/lib/auth.php';
+auth_init_session();
+
+if (auth_is_logged_in()) {
+    header('Location: index.php');
+    exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $user = trim($_POST['username'] ?? '');
+    $pass = (string)($_POST['password'] ?? '');
+    $ip   = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+
+    if (auth_rate_limited($ip)) {
+        $error = 'Zu viele Fehlversuche. Bitte 15 Minuten warten.';
+    } elseif (auth_verify($user, $pass)) {
+        auth_rate_reset($ip);
+        session_regenerate_id(true);
+        $_SESSION['logged_in'] = true;
+        $_SESSION['username']  = $user;
+        $_SESSION['login_at']  = time();
+        header('Location: index.php');
+        exit;
+    } else {
+        auth_rate_record($ip);
+        $error = 'Ungültige Anmeldedaten';
+        usleep(random_int(200000, 600000));
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Caddy Admin</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<div class="container" style="max-width:420px; margin-top:8vh">
+    <div class="card shadow-sm"><div class="card-body p-4">
+        <h4 class="mb-3 text-center">Caddy Admin Login</h4>
+        <?php if ($error !== ''): ?>
+            <div class="alert alert-danger py-2"><?= htmlspecialchars($error, ENT_QUOTES) ?></div>
+        <?php endif; ?>
+        <form method="post" autocomplete="on">
+            <div class="mb-3">
+                <label class="form-label">Benutzername</label>
+                <input type="text" class="form-control" name="username" required autofocus>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Passwort</label>
+                <input type="password" class="form-control" name="password" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Anmelden</button>
+        </form>
+    </div></div>
+</div>
+</body>
+</html>
+EOPHP
+
+    cat > "${INSTALL_DIR}/logout.php" <<'EOPHP'
+<?php
+require_once __DIR__ . '/lib/auth.php';
+auth_init_session();
+$_SESSION = [];
+if (ini_get('session.use_cookies')) {
+    $p = session_get_cookie_params();
+    setcookie(session_name(), '', time() - 42000, $p['path'], $p['domain'], $p['secure'], $p['httponly']);
+}
+session_destroy();
+header('Location: login.php');
+EOPHP
+
+    install -d -m 750 -o "$WEB_USER" -g "$WEB_GROUP" "${INSTALL_DIR}/lib"
+    cat > "${INSTALL_DIR}/lib/auth.php" <<'EOPHP'
+<?php
+const AUTH_FILE        = '/etc/caddy-admin/auth.json';
+const RATE_LIMIT_FILE  = '/var/lib/caddy-admin/rate-limit.json';
+const RATE_LIMIT_MAX   = 5;
+const RATE_LIMIT_WIN   = 900;
+const SESSION_LIFETIME = 3600;
+
+function auth_init_session(): void {
+    if (session_status() === PHP_SESSION_ACTIVE) return;
+    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path'     => '/',
+        'domain'   => '',
+        'secure'   => $secure,
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
+    ini_set('session.use_strict_mode', '1');
+    ini_set('session.use_only_cookies', '1');
+    session_start();
+
+    if (!empty($_SESSION['login_at']) && (time() - $_SESSION['login_at']) > SESSION_LIFETIME) {
+        $_SESSION = [];
+        session_destroy();
+        session_start();
+    }
+}
+
+function auth_is_logged_in(): bool {
+    return !empty($_SESSION['logged_in']) && !empty($_SESSION['username']);
+}
+
+function auth_require_login(): void {
+    auth_init_session();
+    if (!auth_is_logged_in()) {
+        http_response_code(401);
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'message' => 'Nicht authentifiziert']);
+        exit;
+    }
+}
+
+function auth_csrf_token(): string {
+    if (empty($_SESSION['csrf'])) {
+        $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf'];
+}
+
+function auth_check_csrf(): void {
+    $token = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+    if (!is_string($token) || empty($_SESSION['csrf']) || !hash_equals($_SESSION['csrf'], $token)) {
+        http_response_code(403);
+        header('Content-Type: application/json');
+        echo json_encode(['success' => false, 'message' => 'CSRF-Token ungültig']);
+        exit;
+    }
+}
+
+function auth_load(): array {
+    $raw = @file_get_contents(AUTH_FILE);
+    if ($raw === false) return [];
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : [];
+}
+
+function auth_verify(string $user, string $pass): bool {
+    $a = auth_load();
+    if (empty($a['username']) || empty($a['password_hash'])) return false;
+    if (!hash_equals((string)$a['username'], $user)) {
+        password_verify($pass, '$2y$12$' . str_repeat('a', 53));
+        return false;
+    }
+    return password_verify($pass, (string)$a['password_hash']);
+}
+
+function auth_rate_load(): array {
+    $raw = @file_get_contents(RATE_LIMIT_FILE);
+    if ($raw === false) return [];
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : [];
+}
+
+function auth_rate_save(array $data): void {
+    $fp = @fopen(RATE_LIMIT_FILE, 'c+');
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, json_encode($data));
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+}
+
+function auth_rate_limited(string $ip): bool {
+    $data = auth_rate_load();
+    if (!isset($data[$ip])) return false;
+    $now = time();
+    $data[$ip] = array_filter($data[$ip], fn($t) => $t > $now - RATE_LIMIT_WIN);
+    return count($data[$ip]) >= RATE_LIMIT_MAX;
+}
+
+function auth_rate_record(string $ip): void {
+    $data = auth_rate_load();
+    $now  = time();
+    $data[$ip] ??= [];
+    $data[$ip] = array_filter($data[$ip], fn($t) => $t > $now - RATE_LIMIT_WIN);
+    $data[$ip][] = $now;
+    auth_rate_save($data);
+}
+
+function auth_rate_reset(string $ip): void {
+    $data = auth_rate_load();
+    unset($data[$ip]);
+    auth_rate_save($data);
+}
+EOPHP
+
+    cat > "${INSTALL_DIR}/api.php" <<'EOPHP'
+<?php
+require_once __DIR__ . '/lib/auth.php';
+
+header('Content-Type: application/json; charset=utf-8');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: same-origin');
+
+auth_require_login();
+
+const CONFIG_FILE = '/etc/caddy-admin/config.json';
+const RELOAD_HELPER_BIN = '/usr/local/bin/caddy-admin-reload';
+
+function load_config(): array {
+    static $cfg = null;
+    if ($cfg !== null) return $cfg;
+    $raw = @file_get_contents(CONFIG_FILE);
+    if ($raw === false) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Config nicht lesbar']);
+        exit;
+    }
+    $cfg = json_decode($raw, true);
+    if (!is_array($cfg)) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => 'Config korrupt']);
+        exit;
+    }
+    return $cfg;
+}
+
+function db_file(): string { return load_config()['install_dir'] . '/domains.json'; }
+
+function db_read(): array {
+    $f = db_file();
+    if (!file_exists($f)) return ['domains' => []];
+    $fp = @fopen($f, 'r');
+    if (!$fp) return ['domains' => []];
+    flock($fp, LOCK_SH);
+    $raw = stream_get_contents($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    $data = json_decode($raw, true);
+    return is_array($data) && isset($data['domains']) ? $data : ['domains' => []];
+}
+
+function db_write(array $data): bool {
+    $f = db_file();
+    $fp = @fopen($f, 'c+');
+    if (!$fp) return false;
+    if (!flock($fp, LOCK_EX)) { fclose($fp); return false; }
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    return true;
+}
+
+function validate_domain(string $d): string {
+    $d = strtolower(trim($d));
+    if ($d === 'localhost') return $d;
+    if (!preg_match('/^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/', $d)) {
+        throw new RuntimeException('Ungültige Domain');
+    }
+    return $d;
+}
+
+function validate_ip(string $ip): string {
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        throw new RuntimeException('Ungültige IP-Adresse');
+    }
+    return $ip;
+}
+
+function validate_port($p): int {
+    $p = (int)$p;
+    if ($p < 1 || $p > 65535) throw new RuntimeException('Ungültiger Port');
+    return $p;
+}
+
+function validate_protocol(string $p): string {
+    if (!in_array($p, ['http', 'https'], true)) throw new RuntimeException('Ungültiges Protokoll');
+    return $p;
+}
+
+function safe_log_name(string $domain): string {
+    return preg_replace('/[^a-z0-9._-]/', '_', strtolower($domain));
+}
+
+function load_php_sock(): string {
+    foreach (['/run/php/php-fpm.sock', '/run/php-fpm/www.sock'] as $p) {
+        if (file_exists($p)) return $p;
+    }
+    foreach (glob('/run/php/php*-fpm.sock') ?: [] as $p) {
+        return $p;
+    }
+    return '/run/php-fpm/www.sock';
+}
+
+function generate_caddyfile(array $domains): void {
+    $cfg  = load_config();
+    $email = preg_replace('/[^A-Za-z0-9@._+\-]/', '', $cfg['admin_email']);
+    $out  = "# Auto-generiert vom Caddy Admin Panel\n";
+    $out .= "# Manuelle Änderungen werden bei nächstem Reload überschrieben\n\n";
+    $out .= "{\n";
+    $out .= "    admin localhost:2019\n";
+    $out .= "    email {$email}\n";
+    $out .= "}\n\n";
+
+    $admin = $cfg['admin_domain'];
+    $port  = (int)$cfg['admin_port'];
+    if (!empty($cfg['enable_ssl']) && $admin !== 'localhost') {
+        $out .= "{$admin} {\n";
+    } else {
+        $out .= ":{$port} {\n";
+        if ($admin === 'localhost') {
+            $out .= "    tls internal\n";
+        }
+    }
+    $out .= "    root * " . $cfg['install_dir'] . "\n";
+    $out .= "    php_fastcgi unix/" . load_php_sock() . "\n";
+    $out .= "    file_server\n";
+    $out .= "    @denyPrivate path /lib/* /domains.json /.* \n";
+    $out .= "    respond @denyPrivate 403\n";
+    $out .= "}\n\n";
+
+    foreach ($domains as $d) {
+        $domain  = validate_domain($d['domain']);
+        $proto   = validate_protocol($d['protocol'] ?? 'http');
+        $ip      = validate_ip($d['target_ip']);
+        $tport   = validate_port($d['target_port'] ?? 0);
+        $logname = safe_log_name($domain);
+
+        $out .= "{$domain} {\n";
+        if ($domain === 'localhost') {
+            $out .= "    tls internal\n";
+        }
+        $out .= "    reverse_proxy {$proto}://{$ip}:{$tport} {\n";
+        $out .= "        header_up Host {host}\n";
+        $out .= "        header_up X-Real-IP {remote_host}\n";
+        $out .= "        header_up X-Forwarded-For {remote_host}\n";
+        $out .= "        header_up X-Forwarded-Proto {scheme}\n";
+        $out .= "    }\n";
+        $out .= "    log {\n";
+        $out .= "        output file " . $cfg['log_dir'] . "/{$logname}.log\n";
+        $out .= "    }\n";
+        $out .= "}\n\n";
+    }
+
+    if (file_put_contents($cfg['stage_file'], $out) === false) {
+        throw new RuntimeException('Stage-Datei konnte nicht geschrieben werden');
+    }
+}
+
+function reload_caddy(): array {
+    $out = []; $rv = 0;
+    exec('sudo -n ' . escapeshellcmd(RELOAD_HELPER_BIN) . ' 2>&1', $out, $rv);
+    return ['success' => ($rv === 0), 'message' => implode("\n", $out)];
+}
+
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$action = $_GET['action'] ?? '';
+
+if (in_array($method, ['POST', 'PUT', 'DELETE', 'PATCH'], true)) {
+    auth_check_csrf();
+}
+
+$writeActions = ['add', 'update', 'delete', 'reload'];
+if (in_array($action, $writeActions, true) && $method === 'GET') {
+    http_response_code(405);
+    echo json_encode(['success' => false, 'message' => 'Method Not Allowed']);
+    exit;
+}
+
+try {
+    switch ($action) {
+        case 'list':
+            echo json_encode(['success' => true, 'domains' => array_values(db_read()['domains'] ?? [])]);
+            break;
+        case 'get': {
+            $id = (int)($_GET['id'] ?? 0);
+            foreach (db_read()['domains'] as $d) {
+                if ((int)$d['id'] === $id) { echo json_encode(['success' => true, 'domain' => $d]); exit; }
+            }
+            http_response_code(404);
+            echo json_encode(['success' => false, 'message' => 'Nicht gefunden']);
+            break;
+        }
+        case 'add': {
+            $in = json_decode(file_get_contents('php://input'), true);
+            if (!is_array($in)) throw new RuntimeException('Ungültiger Body');
+            $domain = validate_domain($in['domain'] ?? '');
+            $proto  = validate_protocol($in['protocol'] ?? 'http');
+            $ip     = validate_ip($in['target_ip'] ?? '');
+            $port   = validate_port($in['target_port'] ?? 0);
+            $ssl    = !empty($in['enable_ssl']);
+
+            $data = db_read();
+            foreach ($data['domains'] as $d) {
+                if (strcasecmp($d['domain'], $domain) === 0) {
+                    throw new RuntimeException('Domain existiert bereits');
+                }
+            }
+            $maxId = 0;
+            foreach ($data['domains'] as $d) { if ((int)$d['id'] > $maxId) $maxId = (int)$d['id']; }
+            $now = date('c');
+            $data['domains'][] = [
+                'id' => $maxId + 1, 'domain' => $domain, 'target_ip' => $ip,
+                'target_port' => $port, 'protocol' => $proto, 'ssl_enabled' => $ssl,
+                'created_at' => $now, 'updated_at' => $now,
+            ];
+            if (!db_write($data)) throw new RuntimeException('Speichern fehlgeschlagen');
+            generate_caddyfile($data['domains']);
+            $r = reload_caddy();
+            if (!$r['success']) throw new RuntimeException('Caddy-Reload: ' . $r['message']);
+            echo json_encode(['success' => true]);
+            break;
+        }
+        case 'update': {
+            $in = json_decode(file_get_contents('php://input'), true);
+            if (!is_array($in) || empty($in['id'])) throw new RuntimeException('Ungültiger Body');
+            $id     = (int)$in['id'];
+            $domain = validate_domain($in['domain'] ?? '');
+            $proto  = validate_protocol($in['protocol'] ?? 'http');
+            $ip     = validate_ip($in['target_ip'] ?? '');
+            $port   = validate_port($in['target_port'] ?? 0);
+            $ssl    = !empty($in['enable_ssl']);
+
+            $data = db_read();
+            $found = false;
+            foreach ($data['domains'] as &$d) {
+                if ((int)$d['id'] === $id) {
+                    $d['domain'] = $domain; $d['target_ip'] = $ip; $d['target_port'] = $port;
+                    $d['protocol'] = $proto; $d['ssl_enabled'] = $ssl;
+                    $d['updated_at'] = date('c');
+                    $found = true; break;
+                }
+            }
+            unset($d);
+            if (!$found) throw new RuntimeException('Nicht gefunden');
+            if (!db_write($data)) throw new RuntimeException('Speichern fehlgeschlagen');
+            generate_caddyfile($data['domains']);
+            $r = reload_caddy();
+            if (!$r['success']) throw new RuntimeException('Caddy-Reload: ' . $r['message']);
+            echo json_encode(['success' => true]);
+            break;
+        }
+        case 'delete': {
+            $id = (int)($_GET['id'] ?? 0);
+            $data = db_read();
+            $new  = array_values(array_filter($data['domains'], fn($d) => (int)$d['id'] !== $id));
+            if (count($new) === count($data['domains'])) throw new RuntimeException('Nicht gefunden');
+            $data['domains'] = $new;
+            if (!db_write($data)) throw new RuntimeException('Speichern fehlgeschlagen');
+            generate_caddyfile($data['domains']);
+            $r = reload_caddy();
+            if (!$r['success']) throw new RuntimeException('Caddy-Reload: ' . $r['message']);
+            echo json_encode(['success' => true]);
+            break;
+        }
+        case 'test': {
+            $id = (int)($_GET['id'] ?? 0);
+            $found = null;
+            foreach (db_read()['domains'] as $d) { if ((int)$d['id'] === $id) { $found = $d; break; } }
+            if (!$found) throw new RuntimeException('Nicht gefunden');
+            $url = $found['protocol'] . '://' . $found['target_ip'] . ':' . $found['target_port'];
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 5,
+                CURLOPT_NOBODY         => true,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_FOLLOWLOCATION => false,
+            ]);
+            curl_exec($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $err  = curl_error($ch);
+            curl_close($ch);
+            echo json_encode([
+                'success'   => true,
+                'reachable' => ($code > 0),
+                'http_code' => $code,
+                'error'     => $err ?: null,
+            ]);
+            break;
+        }
+        case 'stats': {
+            $domains = db_read()['domains'];
+            $online = 0; $offline = 0;
+            foreach ($domains as $d) {
+                $url = $d['protocol'] . '://' . $d['target_ip'] . ':' . $d['target_port'];
+                $ch = curl_init($url);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_TIMEOUT        => 2,
+                    CURLOPT_NOBODY         => true,
+                    CURLOPT_SSL_VERIFYPEER => true,
+                    CURLOPT_SSL_VERIFYHOST => 2,
+                ]);
+                curl_exec($ch);
+                $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+                if ($code > 0) $online++; else $offline++;
+            }
+            echo json_encode(['success' => true, 'stats' => [
+                'total' => count($domains), 'online' => $online, 'offline' => $offline,
+            ]]);
+            break;
+        }
+        case 'reload':
+            echo json_encode(reload_caddy());
+            break;
+        case 'health':
+            echo json_encode(['success' => true, 'status' => 'healthy', 'timestamp' => time()]);
+            break;
+        default:
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => 'Unbekannte Aktion']);
+    }
+} catch (Throwable $e) {
+    http_response_code(400);
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+}
+EOPHP
+
+    cat > "${INSTALL_DIR}/admin.js" <<'EOJS'
+const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
+document.addEventListener('DOMContentLoaded', () => {
     loadDomains();
     updateStatistics();
 });
 
-// Load all domains
+async function api(action, opts = {}) {
+    const init = {
+        method: opts.method || 'GET',
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin',
+    };
+    if (opts.method && opts.method !== 'GET') {
+        init.headers['X-CSRF-Token'] = CSRF;
+    }
+    if (opts.body !== undefined) {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(opts.body);
+    }
+    const url = `api.php?action=${encodeURIComponent(action)}` +
+        (opts.query ? '&' + new URLSearchParams(opts.query).toString() : '');
+    const res = await fetch(url, init);
+    if (res.status === 401) { window.location.href = 'login.php'; return; }
+    return res.json();
+}
+
 function loadDomains() {
     showLoading();
-    fetch('api.php?action=list')
-        .then(response => response.json())
-        .then(data => {
-            hideLoading();
-            if (data.success) {
-                displayDomains(data.domains);
-                updateStatistics();
-            } else {
-                showToast('Fehler beim Laden der Domains', 'danger');
-            }
-        })
-        .catch(error => {
-            hideLoading();
-            showToast('Netzwerkfehler: ' + error, 'danger');
-        });
+    api('list').then(data => {
+        hideLoading();
+        if (!data || !data.success) return showToast('Fehler beim Laden', 'danger');
+        displayDomains(data.domains);
+        updateStatistics();
+    }).catch(e => { hideLoading(); showToast('Netzwerkfehler: ' + e, 'danger'); });
 }
 
-// Display domains
 function displayDomains(domains) {
-    const container = document.getElementById('domainsList');
-    container.innerHTML = '';
-    
-    if (!domains || domains.length === 0) {
-        container.innerHTML = '<div class="col-12"><div class="alert alert-info">Keine Domains konfiguriert</div></div>';
+    const c = document.getElementById('domainsList');
+    c.innerHTML = '';
+    if (!domains || !domains.length) {
+        c.innerHTML = '<div class="col-12"><div class="alert alert-info">Keine Domains konfiguriert</div></div>';
         return;
     }
-
-    domains.forEach(domain => {
-        const card = createDomainCard(domain);
-        container.innerHTML += card;
-    });
+    domains.forEach(d => c.insertAdjacentHTML('beforeend', cardHTML(d)));
 }
 
-// Create domain card HTML
-function createDomainCard(domain) {
-    const statusClass = domain.status === 'active' ? 'success' : 'warning';
-    const statusText = domain.status === 'active' ? 'Aktiv' : 'Inaktiv';
-    
+function cardHTML(d) {
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     return `
-        <div class="col-md-6 col-lg-4 mb-3">
-            <div class="card domain-card">
-                <div class="card-body">
-                    <span class="badge bg-${statusClass} status-badge">${statusText}</span>
-                    <h5 class="card-title"><i class="bi bi-globe"></i> ${domain.domain}</h5>
-                    <p class="card-text">
-                        <strong>Ziel:</strong> ${domain.target_ip}:${domain.target_port}<br>
-                        <strong>Protokoll:</strong> ${domain.protocol.toUpperCase()}<br>
-                        <strong>SSL:</strong> ${domain.ssl_enabled ? '<i class="bi bi-check-circle text-success"></i>' : '<i class="bi bi-x-circle text-danger"></i>'}
-                    </p>
-                    <div class="btn-group" role="group">
-                        <button class="btn btn-sm btn-primary" onclick="editDomain(${domain.id})">
-                            <i class="bi bi-pencil"></i> Bearbeiten
-                        </button>
-                        <button class="btn btn-sm btn-danger" onclick="deleteDomain(${domain.id})">
-                            <i class="bi bi-trash"></i> Löschen
-                        </button>
-                        <button class="btn btn-sm btn-info" onclick="testConnection(${domain.id})">
-                            <i class="bi bi-wifi"></i> Test
-                        </button>
-                    </div>
+    <div class="col-md-6 col-lg-4 mb-3">
+        <div class="card domain-card">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-globe"></i> ${esc(d.domain)}</h5>
+                <p class="card-text">
+                    <strong>Ziel:</strong> ${esc(d.target_ip)}:${esc(d.target_port)}<br>
+                    <strong>Protokoll:</strong> ${esc(d.protocol.toUpperCase())}<br>
+                    <strong>SSL:</strong> ${d.ssl_enabled ? '<i class="bi bi-check-circle text-success"></i>' : '<i class="bi bi-x-circle text-danger"></i>'}
+                </p>
+                <div class="btn-group">
+                    <button class="btn btn-sm btn-primary" onclick="editDomain(${d.id})"><i class="bi bi-pencil"></i> Bearbeiten</button>
+                    <button class="btn btn-sm btn-danger"  onclick="deleteDomain(${d.id})"><i class="bi bi-trash"></i> Löschen</button>
+                    <button class="btn btn-sm btn-info"    onclick="testConnection(${d.id})"><i class="bi bi-wifi"></i> Test</button>
                 </div>
             </div>
         </div>
-    `;
+    </div>`;
 }
 
-// Save domain
 function saveDomain() {
-    const form = document.getElementById('domainForm');
-    const formData = new FormData(form);
-    const data = Object.fromEntries(formData);
-    data.enable_ssl = document.getElementById('enableSsl').checked;
-    
-    const action = data.id ? 'update' : 'add';
-    
+    const f = document.getElementById('domainForm');
+    const fd = Object.fromEntries(new FormData(f));
+    fd.enable_ssl = document.getElementById('enableSsl').checked;
+    fd.target_port = parseInt(fd.target_port, 10);
+    const action = fd.id ? 'update' : 'add';
     showLoading();
-    fetch(`api.php?action=${action}`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(data)
-    })
-    .then(response => response.json())
-    .then(result => {
+    api(action, { method: 'POST', body: fd }).then(r => {
         hideLoading();
-        if (result.success) {
-            showToast('Domain erfolgreich gespeichert', 'success');
-            bootstrap.Modal.getInstance(document.getElementById('addDomainModal')).hide();
+        if (r && r.success) {
+            showToast('Gespeichert', 'success');
+            bootstrap.Modal.getInstance(document.getElementById('addDomainModal'))?.hide();
+            f.reset();
             loadDomains();
-            form.reset();
         } else {
-            showToast('Fehler: ' + result.message, 'danger');
+            showToast('Fehler: ' + (r?.message || 'unbekannt'), 'danger');
         }
-    })
-    .catch(error => {
-        hideLoading();
-        showToast('Netzwerkfehler: ' + error, 'danger');
-    });
+    }).catch(e => { hideLoading(); showToast('Netzwerkfehler: ' + e, 'danger'); });
 }
 
-// Edit domain
 function editDomain(id) {
     showLoading();
-    fetch(`api.php?action=get&id=${id}`)
-        .then(response => response.json())
-        .then(data => {
-            hideLoading();
-            if (data.success) {
-                const domain = data.domain;
-                document.getElementById('domainId').value = domain.id;
-                document.getElementById('domain').value = domain.domain;
-                document.getElementById('targetIp').value = domain.target_ip;
-                document.getElementById('targetPort').value = domain.target_port;
-                document.getElementById('protocol').value = domain.protocol;
-                document.getElementById('enableSsl').checked = domain.ssl_enabled;
-                document.getElementById('additionalConfig').value = domain.additional_config || '';
-                document.getElementById('modalTitle').textContent = 'Domain bearbeiten';
-                
-                const modal = new bootstrap.Modal(document.getElementById('addDomainModal'));
-                modal.show();
-            } else {
-                showToast('Fehler beim Laden der Domain', 'danger');
-            }
-        })
-        .catch(error => {
-            hideLoading();
-            showToast('Netzwerkfehler: ' + error, 'danger');
-        });
+    api('get', { query: { id } }).then(r => {
+        hideLoading();
+        if (!r || !r.success) return showToast('Fehler beim Laden', 'danger');
+        const d = r.domain;
+        document.getElementById('domainId').value = d.id;
+        document.getElementById('domain').value = d.domain;
+        document.getElementById('targetIp').value = d.target_ip;
+        document.getElementById('targetPort').value = d.target_port;
+        document.getElementById('protocol').value = d.protocol;
+        document.getElementById('enableSsl').checked = !!d.ssl_enabled;
+        document.getElementById('modalTitle').textContent = 'Domain bearbeiten';
+        new bootstrap.Modal(document.getElementById('addDomainModal')).show();
+    }).catch(e => { hideLoading(); showToast('Netzwerkfehler: ' + e, 'danger'); });
 }
 
-// Delete domain
 function deleteDomain(id) {
-    if (!confirm('Möchten Sie diese Domain wirklich löschen?')) {
-        return;
-    }
-    
+    if (!confirm('Domain wirklich löschen?')) return;
     showLoading();
-    fetch(`api.php?action=delete&id=${id}`, {
-        method: 'DELETE'
-    })
-    .then(response => response.json())
-    .then(result => {
+    api('delete', { method: 'DELETE', query: { id } }).then(r => {
         hideLoading();
-        if (result.success) {
-            showToast('Domain erfolgreich gelöscht', 'success');
-            loadDomains();
-        } else {
-            showToast('Fehler: ' + result.message, 'danger');
-        }
-    })
-    .catch(error => {
-        hideLoading();
-        showToast('Netzwerkfehler: ' + error, 'danger');
-    });
+        if (r && r.success) { showToast('Gelöscht', 'success'); loadDomains(); }
+        else showToast('Fehler: ' + (r?.message || 'unbekannt'), 'danger');
+    }).catch(e => { hideLoading(); showToast('Netzwerkfehler: ' + e, 'danger'); });
 }
 
-// Test connection
 function testConnection(id) {
     showLoading();
-    fetch(`api.php?action=test&id=${id}`)
-        .then(response => response.json())
-        .then(result => {
-            hideLoading();
-            if (result.success) {
-                if (result.reachable) {
-                    showToast('Verbindung erfolgreich!', 'success');
-                } else {
-                    showToast('Ziel nicht erreichbar', 'warning');
-                }
-            } else {
-                showToast('Test fehlgeschlagen: ' + result.message, 'danger');
-            }
-        })
-        .catch(error => {
-            hideLoading();
-            showToast('Netzwerkfehler: ' + error, 'danger');
-        });
+    api('test', { query: { id } }).then(r => {
+        hideLoading();
+        if (!r) return;
+        if (r.success && r.reachable) showToast(`Erreichbar (HTTP ${r.http_code})`, 'success');
+        else if (r.success) showToast('Nicht erreichbar', 'warning');
+        else showToast('Fehler: ' + r.message, 'danger');
+    }).catch(e => { hideLoading(); showToast('Netzwerkfehler: ' + e, 'danger'); });
 }
 
-// Reload Caddy configuration
 function reloadCaddy() {
-    if (!confirm('Möchten Sie die Caddy-Konfiguration neu laden?')) {
-        return;
-    }
-    
+    if (!confirm('Caddy-Konfiguration jetzt neu laden?')) return;
     showLoading();
-    fetch('api.php?action=reload', {
-        method: 'POST'
-    })
-    .then(response => response.json())
-    .then(result => {
+    api('reload', { method: 'POST' }).then(r => {
         hideLoading();
-        if (result.success) {
-            showToast('Caddy erfolgreich neu geladen', 'success');
-        } else {
-            showToast('Fehler beim Neuladen: ' + result.message, 'danger');
-        }
-    })
-    .catch(error => {
-        hideLoading();
-        showToast('Netzwerkfehler: ' + error, 'danger');
-    });
+        if (r && r.success) showToast('Caddy neu geladen', 'success');
+        else showToast('Fehler: ' + (r?.message || 'unbekannt'), 'danger');
+    }).catch(e => { hideLoading(); showToast('Netzwerkfehler: ' + e, 'danger'); });
 }
 
-// Update statistics
 function updateStatistics() {
-    fetch('api.php?action=stats')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                document.getElementById('activeDomains').textContent = data.stats.total;
-                document.getElementById('onlineServices').textContent = data.stats.online;
-                document.getElementById('offlineServices').textContent = data.stats.offline;
-            }
-        })
-        .catch(error => console.error('Stats error:', error));
+    api('stats').then(r => {
+        if (!r || !r.success) return;
+        document.getElementById('activeDomains').textContent = r.stats.total;
+        document.getElementById('onlineServices').textContent = r.stats.online;
+        document.getElementById('offlineServices').textContent = r.stats.offline;
+    }).catch(() => {});
 }
 
-// Show loading spinner
-function showLoading() {
-    document.querySelector('.loading-spinner').style.display = 'block';
+function showLoading() { document.querySelector('.loading-spinner').style.display = 'block'; }
+function hideLoading() { document.querySelector('.loading-spinner').style.display = 'none'; }
+
+function showToast(msg, type = 'info') {
+    const id = 't' + Date.now();
+    const html = `<div id="${id}" class="toast align-items-center text-white bg-${type} border-0">
+        <div class="d-flex"><div class="toast-body">${msg}</div>
+        <button class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div></div>`;
+    document.querySelector('.toast-container').insertAdjacentHTML('beforeend', html);
+    const el = document.getElementById(id);
+    new bootstrap.Toast(el).show();
+    el.addEventListener('hidden.bs.toast', () => el.remove());
 }
 
-// Hide loading spinner
-function hideLoading() {
-    document.querySelector('.loading-spinner').style.display = 'none';
-}
-
-// Show toast notification
-function showToast(message, type = 'info') {
-    const toastId = 'toast-' + Date.now();
-    const toastHTML = `
-        <div id="${toastId}" class="toast align-items-center text-white bg-${type} border-0" role="alert">
-            <div class="d-flex">
-                <div class="toast-body">
-                    ${message}
-                </div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
-            </div>
-        </div>
-    `;
-    
-    document.querySelector('.toast-container').insertAdjacentHTML('beforeend', toastHTML);
-    const toastElement = document.getElementById(toastId);
-    const toast = new bootstrap.Toast(toastElement);
-    toast.show();
-    
-    // Remove toast after it's hidden
-    toastElement.addEventListener('hidden.bs.toast', () => {
-        toastElement.remove();
-    });
-}
-
-// Reset modal when closed
-document.getElementById('addDomainModal').addEventListener('hidden.bs.modal', function () {
+document.getElementById('addDomainModal').addEventListener('hidden.bs.modal', () => {
     document.getElementById('domainForm').reset();
     document.getElementById('domainId').value = '';
     document.getElementById('modalTitle').textContent = 'Neue Domain hinzufügen';
 });
 EOJS
 
-    # api.php erstellen (mit angepassten Pfaden)
-    cat > $INSTALL_DIR/api.php << 'EOPHP'
-<?php
-header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
-
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
-
-define('DB_FILE', '/var/www/caddy-admin/domains.json');
-define('CADDYFILE_PATH', '/etc/caddy/Caddyfile');
-define('CADDY_API_URL', 'http://localhost:2019');
-
-if (!file_exists(DB_FILE)) {
-    file_put_contents(DB_FILE, json_encode(['domains' => []]));
-}
-
-$action = $_GET['action'] ?? '';
-$response = ['success' => false, 'message' => 'Invalid action'];
-
-switch ($action) {
-    case 'list':
-        $response = listDomains();
-        break;
-    case 'get':
-        $id = $_GET['id'] ?? 0;
-        $response = getDomain($id);
-        break;
-    case 'add':
-        $data = json_decode(file_get_contents('php://input'), true);
-        $response = addDomain($data);
-        break;
-    case 'update':
-        $data = json_decode(file_get_contents('php://input'), true);
-        $response = updateDomain($data);
-        break;
-    case 'delete':
-        $id = $_GET['id'] ?? 0;
-        $response = deleteDomain($id);
-        break;
-    case 'test':
-        $id = $_GET['id'] ?? 0;
-        $response = testConnection($id);
-        break;
-    case 'reload':
-        $response = reloadCaddy();
-        break;
-    case 'stats':
-        $response = getStatistics();
-        break;
-    case 'health':
-        $response = ['success' => true, 'status' => 'healthy', 'timestamp' => time()];
-        break;
-    default:
-        $response = ['success' => false, 'message' => 'Unknown action'];
-}
-
-echo json_encode($response);
-
-function listDomains() {
-    $data = json_decode(file_get_contents(DB_FILE), true);
-    return ['success' => true, 'domains' => array_values($data['domains'] ?? [])];
-}
-
-function getDomain($id) {
-    $data = json_decode(file_get_contents(DB_FILE), true);
-    foreach ($data['domains'] as $domain) {
-        if ($domain['id'] == $id) {
-            return ['success' => true, 'domain' => $domain];
-        }
-    }
-    return ['success' => false, 'message' => 'Domain not found'];
-}
-
-function addDomain($input) {
-    if (!validateDomainInput($input)) {
-        return ['success' => false, 'message' => 'Invalid input data'];
-    }
-    
-    $data = json_decode(file_get_contents(DB_FILE), true);
-    
-    foreach ($data['domains'] as $domain) {
-        if ($domain['domain'] === $input['domain']) {
-            return ['success' => false, 'message' => 'Domain already exists'];
-        }
-    }
-    
-    $maxId = 0;
-    foreach ($data['domains'] as $domain) {
-        if ($domain['id'] > $maxId) {
-            $maxId = $domain['id'];
-        }
-    }
-    
-    $newDomain = [
-        'id' => $maxId + 1,
-        'domain' => $input['domain'],
-        'target_ip' => $input['target_ip'],
-        'target_port' => $input['target_port'],
-        'protocol' => $input['protocol'] ?? 'http',
-        'ssl_enabled' => $input['enable_ssl'] ?? false,
-        'additional_config' => $input['additional_config'] ?? '',
-        'status' => 'active',
-        'created_at' => date('Y-m-d H:i:s'),
-        'updated_at' => date('Y-m-d H:i:s')
-    ];
-    
-    $data['domains'][] = $newDomain;
-    
-    if (file_put_contents(DB_FILE, json_encode($data, JSON_PRETTY_PRINT))) {
-        generateCaddyfile($data['domains']);
-        return ['success' => true, 'message' => 'Domain added successfully', 'domain' => $newDomain];
-    }
-    
-    return ['success' => false, 'message' => 'Failed to save domain'];
-}
-
-function updateDomain($input) {
-    if (!isset($input['id']) || !validateDomainInput($input)) {
-        return ['success' => false, 'message' => 'Invalid input data'];
-    }
-    
-    $data = json_decode(file_get_contents(DB_FILE), true);
-    $found = false;
-    
-    foreach ($data['domains'] as &$domain) {
-        if ($domain['id'] == $input['id']) {
-            $domain['domain'] = $input['domain'];
-            $domain['target_ip'] = $input['target_ip'];
-            $domain['target_port'] = $input['target_port'];
-            $domain['protocol'] = $input['protocol'] ?? 'http';
-            $domain['ssl_enabled'] = $input['enable_ssl'] ?? false;
-            $domain['additional_config'] = $input['additional_config'] ?? '';
-            $domain['updated_at'] = date('Y-m-d H:i:s');
-            $found = true;
-            break;
-        }
-    }
-    
-    if (!$found) {
-        return ['success' => false, 'message' => 'Domain not found'];
-    }
-    
-    if (file_put_contents(DB_FILE, json_encode($data, JSON_PRETTY_PRINT))) {
-        generateCaddyfile($data['domains']);
-        return ['success' => true, 'message' => 'Domain updated successfully'];
-    }
-    
-    return ['success' => false, 'message' => 'Failed to update domain'];
-}
-
-function deleteDomain($id) {
-    $data = json_decode(file_get_contents(DB_FILE), true);
-    $newDomains = [];
-    $found = false;
-    
-    foreach ($data['domains'] as $domain) {
-        if ($domain['id'] != $id) {
-            $newDomains[] = $domain;
-        } else {
-            $found = true;
-        }
-    }
-    
-    if (!$found) {
-        return ['success' => false, 'message' => 'Domain not found'];
-    }
-    
-    $data['domains'] = $newDomains;
-    
-    if (file_put_contents(DB_FILE, json_encode($data, JSON_PRETTY_PRINT))) {
-        generateCaddyfile($data['domains']);
-        return ['success' => true, 'message' => 'Domain deleted successfully'];
-    }
-    
-    return ['success' => false, 'message' => 'Failed to delete domain'];
-}
-
-function testConnection($id) {
-    $domainData = getDomain($id);
-    
-    if (!$domainData['success']) {
-        return $domainData;
-    }
-    
-    $domain = $domainData['domain'];
-    $url = $domain['protocol'] . '://' . $domain['target_ip'] . ':' . $domain['target_port'];
-    
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-    curl_setopt($ch, CURLOPT_NOBODY, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-    
-    $result = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    
-    return ['success' => true, 'reachable' => ($httpCode > 0), 'http_code' => $httpCode, 'url_tested' => $url];
-}
-
-function generateCaddyfile($domains) {
-    global $ADMIN_EMAIL;
-    $email = getenv('ADMIN_EMAIL') ?: 'admin@example.com';
-    
-    $caddyfile = "# Caddy Reverse Proxy Configuration\n";
-    $caddyfile .= "# Generated by Caddy Admin Panel\n";
-    $caddyfile .= "# " . date('Y-m-d H:i:s') . "\n\n";
-    $caddyfile .= "{\n";
-    $caddyfile .= "    admin localhost:2019\n";
-    $caddyfile .= "    email " . $email . "\n";
-    $caddyfile .= "}\n\n";
-    
-    foreach ($domains as $domain) {
-        $caddyfile .= $domain['domain'] . " {\n";
-        
-        if ($domain['ssl_enabled']) {
-            $caddyfile .= "    tls internal\n";
-        }
-        
-        $target = $domain['protocol'] . '://' . $domain['target_ip'] . ':' . $domain['target_port'];
-        $caddyfile .= "    reverse_proxy " . $target . " {\n";
-        $caddyfile .= "        header_up Host {host}\n";
-        $caddyfile .= "        header_up X-Real-IP {remote}\n";
-        $caddyfile .= "        header_up X-Forwarded-For {remote}\n";
-        $caddyfile .= "        header_up X-Forwarded-Proto {scheme}\n";
-        $caddyfile .= "    }\n";
-        
-        if (!empty($domain['additional_config'])) {
-            $caddyfile .= "\n    # Custom configuration\n";
-            $lines = explode("\n", $domain['additional_config']);
-            foreach ($lines as $line) {
-                $caddyfile .= "    " . $line . "\n";
-            }
-        }
-        
-        $caddyfile .= "\n    log {\n";
-        $caddyfile .= "        output file /var/log/caddy/" . $domain['domain'] . ".log\n";
-        $caddyfile .= "    }\n";
-        $caddyfile .= "}\n\n";
-    }
-    
-    $tempFile = sys_get_temp_dir() . '/Caddyfile.' . time();
-    file_put_contents($tempFile, $caddyfile);
-    exec('sudo /usr/local/bin/update-caddyfile.sh ' . escapeshellarg($tempFile));
-    
-    return true;
-}
-
-function reloadCaddy() {
-    exec('sudo systemctl reload caddy 2>&1', $output, $return_var);
-    
-    if ($return_var === 0) {
-        return ['success' => true, 'message' => 'Caddy reloaded successfully'];
-    }
-    
-    return ['success' => false, 'message' => 'Failed to reload Caddy'];
-}
-
-function getStatistics() {
-    $data = json_decode(file_get_contents(DB_FILE), true);
-    $domains = $data['domains'] ?? [];
-    
-    $stats = ['total' => count($domains), 'online' => 0, 'offline' => 0];
-    
-    foreach ($domains as $domain) {
-        $url = $domain['protocol'] . '://' . $domain['target_ip'] . ':' . $domain['target_port'];
-        
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 2);
-        curl_setopt($ch, CURLOPT_NOBODY, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        
-        curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        
-        if ($httpCode > 0) {
-            $stats['online']++;
-        } else {
-            $stats['offline']++;
-        }
-    }
-    
-    return ['success' => true, 'stats' => $stats];
-}
-
-function validateDomainInput($input) {
-    if (empty($input['domain']) || empty($input['target_ip']) || empty($input['target_port'])) {
-        return false;
-    }
-    
-    if (!preg_match('/^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$/i', $input['domain'])) {
-        return false;
-    }
-    
-    if (!filter_var($input['target_ip'], FILTER_VALIDATE_IP)) {
-        return false;
-    }
-    
-    $port = intval($input['target_port']);
-    if ($port < 1 || $port > 65535) {
-        return false;
-    }
-    
-    return true;
-}
-?>
-EOPHP
-
-    # Environment Variable für E-Mail setzen
-    echo "ADMIN_EMAIL=$ADMIN_EMAIL" >> $INSTALL_DIR/.env
-    
-    echo -e "${GREEN}✓ Admin Panel Dateien erstellt${NC}"
-}
-
-# Webserver konfigurieren
-configure_webserver() {
-    if $USE_NGINX; then
-        configure_nginx
-    else
-        configure_apache
+    if [[ ! -f "${INSTALL_DIR}/domains.json" ]]; then
+        echo '{"domains": []}' > "${INSTALL_DIR}/domains.json"
     fi
+    if [[ ! -f "$RATE_LIMIT_FILE" ]]; then
+        echo '{}' > "$RATE_LIMIT_FILE"
+    fi
+
+    chown -R "${WEB_USER}:${WEB_GROUP}" "$INSTALL_DIR"
+    find "$INSTALL_DIR" -type d -exec chmod 750 {} \;
+    find "$INSTALL_DIR" -type f -exec chmod 640 {} \;
+    chmod 660 "${INSTALL_DIR}/domains.json"
+
+    chown -R "${WEB_USER}:${WEB_GROUP}" "$STAGE_DIR"
+    chmod 660 "$RATE_LIMIT_FILE" 2>/dev/null || true
+
+    ok "Panel-Dateien geschrieben (Permissions restriktiv)"
 }
 
-# Nginx konfigurieren
-configure_nginx() {
-    echo -e "${YELLOW}→ Konfiguriere Nginx...${NC}"
-    
-    # Nginx Konfiguration erstellen
-    cat > /etc/nginx/sites-available/caddy-admin << EONGINX
-server {
-    listen $ADMIN_PORT;
-    server_name $ADMIN_DOMAIN;
-    root $INSTALL_DIR;
-    index index.html index.php;
+# ---- Initiales Caddyfile + Reload-Helper -----------------------------------
 
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php${PHP_VERSION}-fpm.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        include fastcgi_params;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
-
-    access_log /var/log/nginx/caddy-admin-access.log;
-    error_log /var/log/nginx/caddy-admin-error.log;
-}
-EONGINX
-
-    # Site aktivieren
-    ln -sf /etc/nginx/sites-available/caddy-admin /etc/nginx/sites-enabled/
-    
-    # Default site deaktivieren
-    rm -f /etc/nginx/sites-enabled/default
-    
-    # Nginx neustarten
-    systemctl restart nginx
-    
-    echo -e "${GREEN}✓ Nginx konfiguriert${NC}"
-}
-
-# Apache konfigurieren
-configure_apache() {
-    echo -e "${YELLOW}→ Konfiguriere Apache...${NC}"
-    
-    # Apache Konfiguration erstellen
-    if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-        APACHE_SITES="/etc/apache2/sites-available"
-        APACHE_CONF="/etc/apache2/apache2.conf"
-        
-        # Port hinzufügen
-        if ! grep -q "Listen $ADMIN_PORT" /etc/apache2/ports.conf; then
-            echo "Listen $ADMIN_PORT" >> /etc/apache2/ports.conf
+write_caddyfile_initial() {
+    info "Schreibe initiales Caddyfile..."
+    {
+        echo "# Initiales Caddyfile (vom Installer)"
+        echo "{"
+        echo "    admin localhost:2019"
+        echo "    email ${ADMIN_EMAIL}"
+        echo "}"
+        echo
+        if $ENABLE_SSL && [[ "$ADMIN_DOMAIN" != "localhost" ]]; then
+            echo "${ADMIN_DOMAIN} {"
+        else
+            echo ":${ADMIN_PORT} {"
+            if [[ "$ADMIN_DOMAIN" == "localhost" ]]; then
+                echo "    tls internal"
+            fi
         fi
-        
-    elif [[ "$OS_ID" == "centos" ]] || [[ "$OS_ID" == "rhel" ]] || [[ "$OS_ID" == "fedora" ]]; then
-        APACHE_SITES="/etc/httpd/conf.d"
-        APACHE_CONF="/etc/httpd/conf/httpd.conf"
-        
-        # Port hinzufügen
-        if ! grep -q "Listen $ADMIN_PORT" $APACHE_CONF; then
-            echo "Listen $ADMIN_PORT" >> $APACHE_CONF
-        fi
+        echo "    root * ${INSTALL_DIR}"
+        echo "    php_fastcgi unix/${PHP_FPM_SOCK}"
+        echo "    file_server"
+        echo "    @denyPrivate path /lib/* /domains.json /.*"
+        echo "    respond @denyPrivate 403"
+        echo "}"
+    } > "$CADDY_LIVE_FILE"
+
+    chown root:caddy "$CADDY_LIVE_FILE" 2>/dev/null || chown root:root "$CADDY_LIVE_FILE"
+    chmod 644 "$CADDY_LIVE_FILE"
+
+    if ! caddy validate --config "$CADDY_LIVE_FILE" --adapter caddyfile >/dev/null 2>&1; then
+        warn "Caddyfile-Validierung fehlgeschlagen — bitte $CADDY_LIVE_FILE prüfen"
     fi
-    
-    # Virtual Host erstellen
-    cat > $APACHE_SITES/caddy-admin.conf << EOAPACHE
-<VirtualHost *:$ADMIN_PORT>
-    ServerName $ADMIN_DOMAIN
-    DocumentRoot $INSTALL_DIR
-    
-    <Directory $INSTALL_DIR>
-        Options Indexes FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-    
-    ErrorLog \${APACHE_LOG_DIR}/caddy-admin-error.log
-    CustomLog \${APACHE_LOG_DIR}/caddy-admin-access.log combined
-</VirtualHost>
-EOAPACHE
-
-    # Site aktivieren und Apache neustarten
-    if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-        a2ensite caddy-admin > /dev/null 2>&1
-        a2dissite 000-default > /dev/null 2>&1
-        systemctl restart apache2
-    else
-        systemctl restart httpd
-    fi
-    
-    echo -e "${GREEN}✓ Apache konfiguriert${NC}"
+    ok "Caddyfile geschrieben: $CADDY_LIVE_FILE"
 }
 
-# Caddy konfigurieren
-configure_caddy() {
-    echo -e "${YELLOW}→ Konfiguriere Caddy...${NC}"
-    
-    # Basis Caddyfile erstellen
-    cat > $CADDY_CONFIG_DIR/Caddyfile << EOCADDY
-{
-    admin localhost:2019
-    email $ADMIN_EMAIL
-}
-
-# Admin Panel (falls SSL aktiviert)
-EOCADDY
-
-    if $ENABLE_SSL && [[ "$ADMIN_DOMAIN" != "localhost" ]]; then
-        cat >> $CADDY_CONFIG_DIR/Caddyfile << EOCADDY
-$ADMIN_DOMAIN {
-    reverse_proxy localhost:$ADMIN_PORT
-}
-
-EOCADDY
-    fi
-
-    # Caddy neustarten
-    systemctl restart caddy
-    
-    echo -e "${GREEN}✓ Caddy konfiguriert${NC}"
-}
-
-# Sudo-Berechtigungen konfigurieren
-configure_sudo() {
-    echo -e "${YELLOW}→ Konfiguriere Sudo-Berechtigungen...${NC}"
-    
-    # Update-Script erstellen
-    cat > /usr/local/bin/update-caddyfile.sh << 'EOSCRIPT'
+write_reload_helper() {
+    info "Schreibe Reload-Helper..."
+    cat > "$RELOAD_HELPER" <<'EOSH'
 #!/bin/bash
-TEMP_FILE=$1
-CADDY_FILE="/etc/caddy/Caddyfile"
+# Reload-Helper für das Caddy Admin Panel.
+# Wird von www-data via sudo OHNE ARGUMENTE aufgerufen.
+# Liest fix /var/lib/caddy-admin/Caddyfile.staged — keine Argumente von außen.
+
+set -euo pipefail
+
+STAGE="/var/lib/caddy-admin/Caddyfile.staged"
+LIVE="/etc/caddy/Caddyfile"
 BACKUP_DIR="/var/backups/caddy"
+MAX_BACKUPS_PER_DAY=10
 
-mkdir -p $BACKUP_DIR
-cp $CADDY_FILE "$BACKUP_DIR/Caddyfile.$(date +%Y%m%d_%H%M%S)"
+[[ -f "$STAGE" ]] || { echo "Kein gestagedes Caddyfile vorhanden: $STAGE" >&2; exit 1; }
 
-if caddy validate --config $TEMP_FILE 2>/dev/null; then
-    cp $TEMP_FILE $CADDY_FILE
-    systemctl reload caddy
-    echo "Caddyfile updated successfully"
-    exit 0
-else
-    echo "Invalid Caddyfile"
-    exit 1
+if ! /usr/bin/caddy validate --config "$STAGE" --adapter caddyfile >/dev/null 2>&1; then
+    /usr/bin/caddy validate --config "$STAGE" --adapter caddyfile >&2 || true
+    echo "Caddyfile-Validierung fehlgeschlagen, Reload abgebrochen" >&2
+    exit 2
 fi
-EOSCRIPT
 
-    chmod +x /usr/local/bin/update-caddyfile.sh
-    
-    # Sudoers Datei erstellen
-    cat > /etc/sudoers.d/caddy-admin << EOSUDO
-# Caddy Admin Panel Permissions
-www-data ALL=(ALL) NOPASSWD: /usr/bin/caddy reload
-www-data ALL=(ALL) NOPASSWD: /usr/bin/caddy validate
-www-data ALL=(ALL) NOPASSWD: /usr/local/bin/update-caddyfile.sh
-www-data ALL=(ALL) NOPASSWD: /bin/systemctl reload caddy
-www-data ALL=(ALL) NOPASSWD: /bin/systemctl restart caddy
+mkdir -p "$BACKUP_DIR"
+TODAY="$(date +%Y%m%d)"
+COUNT=$(find "$BACKUP_DIR" -maxdepth 1 -name "Caddyfile.${TODAY}_*" -type f | wc -l)
+if [[ -f "$LIVE" && "$COUNT" -lt "$MAX_BACKUPS_PER_DAY" ]]; then
+    cp -p "$LIVE" "${BACKUP_DIR}/Caddyfile.${TODAY}_$(date +%H%M%S)"
+fi
+
+install -m 644 -o root -g caddy "$STAGE" "$LIVE" 2>/dev/null \
+    || install -m 644 -o root -g root  "$STAGE" "$LIVE"
+/bin/systemctl reload caddy
+echo "Caddy erfolgreich neu geladen"
+EOSH
+    chown root:root "$RELOAD_HELPER"
+    chmod 750 "$RELOAD_HELPER"
+    ok "Reload-Helper installiert: $RELOAD_HELPER"
+}
+
+setup_sudoers() {
+    info "Konfiguriere Sudo (minimal, ohne Argumente)..."
+    cat > "${SUDOERS_FILE}.tmp" <<EOSUDO
+# Caddy Admin Panel — minimale Sudo-Rechte
+# Reload-Helper akzeptiert KEINE Argumente. Stage-Pfad ist im Helper fest verdrahtet.
+${WEB_USER} ALL=(root) NOPASSWD: ${RELOAD_HELPER}
+Defaults!${RELOAD_HELPER} !requiretty, env_reset
 EOSUDO
-
-    chmod 440 /etc/sudoers.d/caddy-admin
-    
-    echo -e "${GREEN}✓ Sudo-Berechtigungen konfiguriert${NC}"
-}
-
-# Dateiberechtigungen setzen
-set_permissions() {
-    echo -e "${YELLOW}→ Setze Dateiberechtigungen...${NC}"
-    
-    # Verzeichnisse erstellen
-    mkdir -p $LOG_DIR
-    mkdir -p $BACKUP_DIR
-    
-    # Berechtigungen setzen
-    chown -R www-data:www-data $INSTALL_DIR
-    chmod 755 $INSTALL_DIR
-    chmod 644 $INSTALL_DIR/*
-    chmod 755 $INSTALL_DIR/api.php
-    
-    # Log-Verzeichnis
-    chown caddy:caddy $LOG_DIR
-    chmod 755 $LOG_DIR
-    
-    # Backup-Verzeichnis
-    chown www-data:www-data $BACKUP_DIR
-    chmod 755 $BACKUP_DIR
-    
-    # JSON Datei erstellen
-    touch $INSTALL_DIR/domains.json
-    chown www-data:www-data $INSTALL_DIR/domains.json
-    chmod 664 $INSTALL_DIR/domains.json
-    
-    echo -e "${GREEN}✓ Dateiberechtigungen gesetzt${NC}"
-}
-
-# Firewall konfigurieren
-configure_firewall() {
-    if $ENABLE_FIREWALL; then
-        echo -e "${YELLOW}→ Konfiguriere Firewall...${NC}"
-        
-        # UFW installieren falls nicht vorhanden
-        if ! command -v ufw &> /dev/null; then
-            $PKG_INSTALL ufw > /dev/null 2>&1
-        fi
-        
-        # Firewall-Regeln
-        ufw allow 22/tcp > /dev/null 2>&1  # SSH
-        ufw allow 80/tcp > /dev/null 2>&1  # HTTP
-        ufw allow 443/tcp > /dev/null 2>&1 # HTTPS
-        ufw allow $ADMIN_PORT/tcp > /dev/null 2>&1 # Admin Panel
-        
-        # Firewall aktivieren
-        ufw --force enable > /dev/null 2>&1
-        
-        echo -e "${GREEN}✓ Firewall konfiguriert${NC}"
+    chmod 440 "${SUDOERS_FILE}.tmp"
+    if visudo -c -q -f "${SUDOERS_FILE}.tmp"; then
+        mv "${SUDOERS_FILE}.tmp" "$SUDOERS_FILE"
+    else
+        rm -f "${SUDOERS_FILE}.tmp"
+        err "Sudoers-Validierung fehlgeschlagen"
     fi
+    ok "Sudoers geschrieben: $SUDOERS_FILE"
 }
 
-# SSL Zertifikat einrichten
-setup_ssl() {
-    if $ENABLE_SSL && [[ "$ADMIN_DOMAIN" != "localhost" ]]; then
-        echo -e "${YELLOW}→ Richte SSL-Zertifikat ein...${NC}"
-        
-        # Certbot installieren
-        if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-            $PKG_INSTALL certbot > /dev/null 2>&1
-            
-            if $USE_NGINX; then
-                $PKG_INSTALL python3-certbot-nginx > /dev/null 2>&1
-                certbot --nginx -d $ADMIN_DOMAIN --non-interactive --agree-tos -m $ADMIN_EMAIL > /dev/null 2>&1
-            else
-                $PKG_INSTALL python3-certbot-apache > /dev/null 2>&1
-                certbot --apache -d $ADMIN_DOMAIN --non-interactive --agree-tos -m $ADMIN_EMAIL > /dev/null 2>&1
-            fi
-        fi
-        
-        echo -e "${GREEN}✓ SSL-Zertifikat eingerichtet${NC}"
+# ---- Firewall + Backup -----------------------------------------------------
+
+setup_firewall() {
+    if ! $ENABLE_FIREWALL; then
+        ok "Firewall-Konfiguration übersprungen"
+        return
     fi
+    info "Konfiguriere Firewall..."
+    if ! command -v ufw >/dev/null 2>&1; then
+        $PKG_INSTALL ufw >/dev/null
+    fi
+    ufw allow 22/tcp  >/dev/null 2>&1 || true
+    ufw allow 80/tcp  >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw allow "${ADMIN_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw --force enable >/dev/null 2>&1 || warn "ufw enable fehlgeschlagen"
+    ok "Firewall konfiguriert (22, 80, 443, ${ADMIN_PORT})"
 }
 
-# Backup-Script erstellen
-create_backup_script() {
-    echo -e "${YELLOW}→ Erstelle Backup-Script...${NC}"
-    
-    cat > /usr/local/bin/backup-caddy.sh << 'EOBACKUP'
+write_backup_script() {
+    info "Schreibe Backup-Skript..."
+    cat > /usr/local/bin/backup-caddy.sh <<EOBACKUP
 #!/bin/bash
-BACKUP_DIR="/var/backups/caddy"
-DATE=$(date +%Y%m%d_%H%M%S)
-
-mkdir -p $BACKUP_DIR
-
-# Konfiguration sichern
-cp /etc/caddy/Caddyfile $BACKUP_DIR/Caddyfile.$DATE
-cp /var/www/caddy-admin/domains.json $BACKUP_DIR/domains.$DATE.json
-
-# Zertifikate sichern
-if [ -d /var/lib/caddy ]; then
-    tar czf $BACKUP_DIR/certificates.$DATE.tar.gz /var/lib/caddy/
+set -euo pipefail
+BACKUP_DIR="${BACKUP_DIR}"
+DATE="\$(date +%Y%m%d_%H%M%S)"
+mkdir -p "\$BACKUP_DIR"
+[[ -f "${CADDY_LIVE_FILE}" ]] && cp -p "${CADDY_LIVE_FILE}" "\$BACKUP_DIR/Caddyfile.\$DATE"
+[[ -f "${INSTALL_DIR}/domains.json" ]] && cp -p "${INSTALL_DIR}/domains.json" "\$BACKUP_DIR/domains.\$DATE.json"
+if [[ -d /var/lib/caddy ]]; then
+    tar czf "\$BACKUP_DIR/certificates.\$DATE.tar.gz" /var/lib/caddy/ 2>/dev/null || true
 fi
-
-# Alte Backups löschen (älter als 30 Tage)
-find $BACKUP_DIR -type f -mtime +30 -delete
-
-echo "Backup completed: $BACKUP_DIR"
+find "\$BACKUP_DIR" -type f -mtime +30 -delete
+echo "Backup completed: \$BACKUP_DIR"
 EOBACKUP
-
-    chmod +x /usr/local/bin/backup-caddy.sh
-    
-    # Cron-Job für tägliches Backup
+    chmod 750 /usr/local/bin/backup-caddy.sh
     echo "0 2 * * * root /usr/local/bin/backup-caddy.sh" > /etc/cron.d/caddy-backup
-    
-    echo -e "${GREEN}✓ Backup-Script erstellt${NC}"
+    chmod 644 /etc/cron.d/caddy-backup
+    ok "Backup-Skript installiert (täglich 02:00)"
 }
 
-# Service Status überprüfen
+# ---- Services ---------------------------------------------------------------
+
+start_services() {
+    info "Starte Services..."
+    systemctl restart "$PHP_FPM_SERVICE"
+    systemctl restart caddy
+    ok "Services gestartet"
+}
+
 check_services() {
-    echo ""
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}Service Status:${NC}"
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    
-    # Caddy
-    if systemctl is-active --quiet caddy; then
-        echo -e "  Caddy: ${GREEN}✓ Läuft${NC}"
-    else
-        echo -e "  Caddy: ${RED}✗ Gestoppt${NC}"
-    fi
-    
-    # Webserver
-    if $USE_NGINX; then
-        if systemctl is-active --quiet nginx; then
-            echo -e "  Nginx: ${GREEN}✓ Läuft${NC}"
+    hr
+    echo -e "${YELLOW}Service-Status:${NC}"
+    hr
+    for svc in caddy "$PHP_FPM_SERVICE"; do
+        if systemctl is-active --quiet "$svc"; then
+            echo -e "  $svc: ${GREEN}✓ läuft${NC}"
         else
-            echo -e "  Nginx: ${RED}✗ Gestoppt${NC}"
+            echo -e "  $svc: ${RED}✗ gestoppt${NC}"
         fi
-    else
-        if [[ "$OS_ID" == "ubuntu" ]] || [[ "$OS_ID" == "debian" ]]; then
-            if systemctl is-active --quiet apache2; then
-                echo -e "  Apache: ${GREEN}✓ Läuft${NC}"
-            else
-                echo -e "  Apache: ${RED}✗ Gestoppt${NC}"
-            fi
-        else
-            if systemctl is-active --quiet httpd; then
-                echo -e "  Apache: ${GREEN}✓ Läuft${NC}"
-            else
-                echo -e "  Apache: ${RED}✗ Gestoppt${NC}"
-            fi
-        fi
-    fi
+    done
 }
 
-# Installation abschließen
-finish_installation() {
-    echo ""
-    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}           Installation erfolgreich abgeschlossen!              ${NC}"
-    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${BLUE}Zugriff auf Admin Panel:${NC}"
-    
+print_summary() {
+    echo
+    hr
+    echo -e "${GREEN}Installation erfolgreich abgeschlossen!${NC}"
+    hr
+    echo -e "${BLUE}Zugriff auf das Admin Panel:${NC}"
     if [[ "$ADMIN_DOMAIN" == "localhost" ]]; then
-        echo -e "  URL: ${GREEN}http://$(hostname -I | awk '{print $1}'):$ADMIN_PORT${NC}"
+        local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        echo -e "  URL:  ${GREEN}https://${ip:-127.0.0.1}:${ADMIN_PORT}/${NC}"
+        echo -e "        ${YELLOW}(self-signed Caddy-CA — beim ersten Zugriff im Browser akzeptieren)${NC}"
+    elif $ENABLE_SSL; then
+        echo -e "  URL:  ${GREEN}https://${ADMIN_DOMAIN}/${NC}"
+        echo -e "        ${YELLOW}(DNS muss auf diese Maschine zeigen, sonst schlägt Let's Encrypt fehl)${NC}"
     else
-        if $ENABLE_SSL; then
-            echo -e "  URL: ${GREEN}https://$ADMIN_DOMAIN${NC}"
-        else
-            echo -e "  URL: ${GREEN}http://$ADMIN_DOMAIN:$ADMIN_PORT${NC}"
-        fi
+        echo -e "  URL:  ${GREEN}http://${ADMIN_DOMAIN}:${ADMIN_PORT}/${NC}"
     fi
-    
-    echo ""
+    echo -e "  User: ${BLUE}${ADMIN_USER}${NC}"
+    echo
     echo -e "${BLUE}Wichtige Pfade:${NC}"
-    echo -e "  Web-Dateien: ${YELLOW}$INSTALL_DIR${NC}"
-    echo -e "  Caddy Config: ${YELLOW}$CADDY_CONFIG_DIR/Caddyfile${NC}"
-    echo -e "  Logs: ${YELLOW}$LOG_DIR${NC}"
-    echo -e "  Backups: ${YELLOW}$BACKUP_DIR${NC}"
-    
-    echo ""
-    echo -e "${BLUE}Nützliche Befehle:${NC}"
-    echo -e "  Status prüfen: ${YELLOW}systemctl status caddy${NC}"
-    echo -e "  Logs anzeigen: ${YELLOW}journalctl -u caddy -f${NC}"
-    echo -e "  Backup erstellen: ${YELLOW}/usr/local/bin/backup-caddy.sh${NC}"
-    
-    echo ""
-    echo -e "${YELLOW}Hinweis: Vergessen Sie nicht, die DNS-Einträge für Ihre Domains${NC}"
-    echo -e "${YELLOW}auf die öffentliche IP dieses Servers zu zeigen!${NC}"
-    echo ""
+    echo -e "  Web-Dateien:   ${YELLOW}${INSTALL_DIR}${NC}"
+    echo -e "  Caddyfile:     ${YELLOW}${CADDY_LIVE_FILE}${NC}"
+    echo -e "  Auth/Config:   ${YELLOW}${ADMIN_CONFIG_DIR}${NC}"
+    echo -e "  Stage:         ${YELLOW}${STAGE_DIR}${NC}"
+    echo -e "  Logs:          ${YELLOW}${LOG_DIR}${NC}"
+    echo -e "  Backups:       ${YELLOW}${BACKUP_DIR}${NC}"
+    echo
+    echo -e "${BLUE}Befehle:${NC}"
+    echo -e "  Status:        ${YELLOW}systemctl status caddy ${PHP_FPM_SERVICE}${NC}"
+    echo -e "  Caddy-Logs:    ${YELLOW}journalctl -u caddy -f${NC}"
+    echo -e "  Backup:        ${YELLOW}/usr/local/bin/backup-caddy.sh${NC}"
+    echo
+    echo -e "${YELLOW}Sicherheits-Hinweise:${NC}"
+    echo -e "  • Verwende öffentliche Erreichbarkeit nur mit aktiviertem Let's-Encrypt-SSL."
+    echo -e "  • Bei localhost ohne TLS niemals direkt im Internet exponieren."
+    echo -e "  • Passwort-Reset: ${ADMIN_AUTH_FILE} neu schreiben (bcrypt-Hash, mode 0640)."
 }
 
-# Main Installation
+# ---- Main -------------------------------------------------------------------
+
 main() {
     check_root
     show_banner
     detect_os
-    get_user_input
-    
-    echo ""
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
+    prompt_config
+
+    hr
     echo -e "${YELLOW}Starte Installation...${NC}"
-    echo -e "${BLUE}══════════════════════════════════════════════════════════════${NC}"
-    
+    hr
+
     update_system
-    install_base_packages
     install_caddy
     install_php
-    install_webserver
-    create_admin_panel_files
-    configure_webserver
-    configure_caddy
-    configure_sudo
-    set_permissions
-    configure_firewall
-    setup_ssl
-    create_backup_script
+
+    setup_directories
+    write_panel_files
+    write_config_files
+    write_caddyfile_initial
+    write_reload_helper
+    setup_sudoers
+    write_backup_script
+    setup_firewall
+    start_services
+
     check_services
-    finish_installation
+    print_summary
 }
 
-# Script starten
-main
+# Nur ausführen, wenn das Skript direkt aufgerufen wird — nicht beim Sourcen
+# (z.B. aus den Bats-Tests, die die Validierungs-Funktionen prüfen).
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    main "$@"
+fi
